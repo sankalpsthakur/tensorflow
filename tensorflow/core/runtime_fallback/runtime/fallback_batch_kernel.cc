@@ -153,6 +153,11 @@ BatchFunctionFallbackKernelBase::BatchFunctionFallbackKernelBase(
         c, c->GetAttr("num_warmup_batch_threads", &num_warmup_batch_threads_));
   }
 
+  if (c->HasAttr("per_criticality_batch_timeout_micros")) {
+    OP_REQUIRES_OK(c, c->GetAttr("per_criticality_batch_timeout_micros",
+                                 &per_criticality_batch_timeout_micros_));
+  }
+
   // Helper function `SetAdaptiveBatchSchedulerOptions` calls
   // `OP_REQUIRES_OK`, which exits the current function upon error.
   // So validate status of `op-kernel-construction`.

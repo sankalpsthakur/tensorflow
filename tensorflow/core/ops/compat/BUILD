@@ -62,7 +62,6 @@ tf_cc_test(
     ],
     deps = [
         ":op_compatibility_lib",
-        "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//tensorflow/core:test",
         "//tensorflow/core:test_main",

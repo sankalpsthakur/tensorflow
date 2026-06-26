@@ -192,7 +192,8 @@ class BatchResource : public serving::BatchResourceBase {
                   /*enable_priority_aware_batch_scheduler_resplit=*/false,
                   /*enable_batching_task_lazy_cancellation=*/false,
                   /*batch_padding_policy=*/"PAD_UP",
-                  /*num_warmup_batch_threads=*/0, resource);
+                  /*num_warmup_batch_threads=*/0,
+                  /*per_criticality_batch_timeout_micros=*/{}, resource);
   }
 
   static absl::Status Create(
@@ -210,6 +211,7 @@ class BatchResource : public serving::BatchResourceBase {
       bool enable_priority_aware_batch_scheduler_resplit,
       bool enable_batching_task_lazy_cancellation,
       absl::string_view batch_padding_policy, int32_t num_warmup_batch_threads,
+      const std::vector<int64_t>& per_criticality_batch_timeout_micros,
       std::unique_ptr<BatchResource>* resource) {
     BatcherT::Options batcher_options;
     batcher_options.num_batch_threads = num_batch_threads;
@@ -245,7 +247,8 @@ class BatchResource : public serving::BatchResourceBase {
             mixed_priority_batching_policy,
             enable_priority_aware_batch_scheduler,
             enable_priority_aware_batch_scheduler_resplit,
-            enable_batching_task_lazy_cancellation),
+            enable_batching_task_lazy_cancellation,
+            per_criticality_batch_timeout_micros),
         allowed_batch_sizes));
     return absl::OkStatus();
   }
@@ -362,6 +365,11 @@ BatchFunctionKernel::BatchFunctionKernel(OpKernelConstruction* c)
     OP_REQUIRES_OK(c,
                    c->GetAttr("enable_priority_aware_batch_scheduler_resplit",
                               &enable_priority_aware_batch_scheduler_resplit_));
+  }
+
+  if (c->HasAttr("per_criticality_batch_timeout_micros")) {
+    OP_REQUIRES_OK(c, c->GetAttr("per_criticality_batch_timeout_micros",
+                                 &per_criticality_batch_timeout_micros_));
   }
 
   if (c->HasAttr("enable_batching_task_lazy_cancellation")) {
@@ -501,7 +509,8 @@ void BatchFunctionKernel::ComputeAsync(OpKernelContext* c, DoneCallback done) {
           enable_priority_aware_batch_scheduler_,
           enable_priority_aware_batch_scheduler_resplit_,
           enable_batching_task_lazy_cancellation_, batch_padding_policy_,
-          num_warmup_batch_threads_, &new_resource));
+          num_warmup_batch_threads_, per_criticality_batch_timeout_micros_,
+          &new_resource));
       if (session_metadata) {
         new_resource->set_session_metadata(*session_metadata);
       }
