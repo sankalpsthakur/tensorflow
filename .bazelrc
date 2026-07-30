@@ -68,6 +68,15 @@
 # LINT.IfChange
 # Default build options. These are applied first and unconditionally.
 
+# external_include_paths feature forces passing external repositories headers
+# via -isystem alters how Clang resolves their file paths. This mismatch with
+# Bazel's auto-generated module maps prevents Clang from recognizing the
+# dependency, triggering layering_check errors.
+# Following lines can be removed after rules_cc will be updated
+# (path-mapping issues are resolved in upstream rules_cc)
+common --features=-external_include_paths
+common --host_features=-external_include_paths
+
 # These are used to generate the ML wheel version string.
 # See the explanation in the file comment of
 # @xla//third_party/py/python_wheel.bzl.
