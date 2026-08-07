@@ -18,11 +18,13 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/algorithm/container.h"
 #include "xla/array.h"
 #include "xla/hlo/ir/hlo_sharding.h"
 #include "xla/hlo/ir/mesh_and_axis.h"
@@ -35,6 +37,32 @@ namespace xla {
 namespace spmd {
 
 namespace {
+
+std::set<std::vector<int64_t>> ToCanonicalSet(
+    const std::vector<std::vector<int64_t>>& groups) {
+  std::set<std::vector<int64_t>> result;
+  for (const auto& group : groups) {
+    result.insert(group);
+  }
+  return result;
+}
+
+void v2AndV3ReplicaGroupsMatch(
+    std::optional<IotaReplicaGroupList> v2_group_list,
+    std::optional<MeshAxesReplicaGroupList> v3_group_list,
+    int64_t expected_num_replica_groups,
+    int64_t expected_num_devices_per_group) {
+  EXPECT_TRUE(v2_group_list.has_value());
+  EXPECT_TRUE(v3_group_list.has_value());
+  EXPECT_EQ(v2_group_list->num_replica_groups(), expected_num_replica_groups);
+  EXPECT_EQ(v3_group_list->num_replica_groups(), expected_num_replica_groups);
+  EXPECT_EQ(v2_group_list->num_devices_per_group(),
+            expected_num_devices_per_group);
+  EXPECT_EQ(v3_group_list->num_devices_per_group(),
+            expected_num_devices_per_group);
+  EXPECT_EQ(ToCanonicalSet(v2_group_list->flattened_replica_groups()),
+            ToCanonicalSet(v3_group_list->flattened_replica_groups()));
+}
 
 TEST(SPMDPartitionerUtilTest, PartialReplicateReshardCompatibleSharding1) {
   HloSharding partial_sharding =
@@ -420,6 +448,52 @@ TEST(SPMDPartitionerUtilTest, GetMeshAxesPartitionGroupsForReplication) {
   EXPECT_EQ(v3_group_list->num_replica_groups(), 4);
   EXPECT_EQ(v3_group_list->num_devices_per_group(), 2);
   EXPECT_EQ(v3_group_list->ToString(), "mesh['Q'=2,'K'=2,'V'=2] {'K'}");
+
+  // V1 Sharding with iota device ordering (identity)
+  Array<int64_t> tile_array_v1({2, 2, 2});
+  tile_array_v1(0, 0, 0) = 0;
+  tile_array_v1(0, 0, 1) = 1;
+  tile_array_v1(0, 1, 0) = 2;
+  tile_array_v1(0, 1, 1) = 3;
+  tile_array_v1(1, 0, 0) = 4;
+  tile_array_v1(1, 0, 1) = 5;
+  tile_array_v1(1, 1, 0) = 6;
+  tile_array_v1(1, 1, 1) = 7;
+  HloSharding sharding_v1 = HloSharding::Tile(tile_array_v1);
+  EXPECT_FALSE(sharding_v1.tile_assignment().iota().has_value());
+  v3_group_list = GetMeshAxesPartitionGroupsForReplication(sharding_v1, {1});
+  EXPECT_TRUE(v3_group_list.has_value());
+  EXPECT_EQ(v3_group_list->num_replica_groups(), 4);
+  EXPECT_EQ(v3_group_list->num_devices_per_group(), 2);
+  EXPECT_EQ(v3_group_list->ToString(),
+            "mesh['axis_0'=2,'axis_1'=2,'axis_2'=2] {'axis_1'}");
+
+  // V1 Sharding with iota device ordering (transposed)
+  Array<int64_t> tile_array_v1_transposed({2, 2});
+  tile_array_v1_transposed(0, 0) = 0;
+  tile_array_v1_transposed(0, 1) = 2;
+  tile_array_v1_transposed(1, 0) = 1;
+  tile_array_v1_transposed(1, 1) = 3;
+  HloSharding sharding_v1_transposed =
+      HloSharding::Tile(tile_array_v1_transposed);
+  EXPECT_FALSE(sharding_v1_transposed.tile_assignment().iota().has_value());
+  v3_group_list =
+      GetMeshAxesPartitionGroupsForReplication(sharding_v1_transposed, {0});
+  EXPECT_TRUE(v3_group_list.has_value());
+  EXPECT_EQ(v3_group_list->ToString(),
+            "mesh['axis_0'=2,'axis_1'=2] {'axis_1'}");
+
+  // V2 Sharding with non-trivial reshape and transpose
+  // sharding: [6,35]<=[7,10,3]T(2,1,0)
+  // replicate dim: {0}
+  HloSharding sharding_complex =
+      HloSharding::IotaTile({6, 35}, {7, 10, 3}, {2, 1, 0});
+  v3_group_list =
+      GetMeshAxesPartitionGroupsForReplication(sharding_complex, {0});
+  EXPECT_TRUE(v3_group_list.has_value());
+  EXPECT_EQ(
+      v3_group_list->ToString(),
+      "mesh['axis_0'=7,'axis_1'=2,'axis_2'=5,'axis_3'=3] {'axis_3','axis_1'}");
 }
 
 TEST(SPMDPartitionerUtilTest,
@@ -497,24 +571,6 @@ TEST(SPMDPartitionerUtilDeathTest, V3PartitionGroupsFailForInvalidInputs) {
 
 TEST(SPMDPartitionerUtilTest,
      ValidateEqualityOfV2AndV3ReplicaGroupsAcrossTargetDims) {
-  auto v2AndV3ReplicaGroupsMatch =
-      [](std::optional<IotaReplicaGroupList> v2_group_list,
-         std::optional<MeshAxesReplicaGroupList> v3_group_list,
-         int64_t expected_num_replica_groups,
-         int64_t expected_num_devices_per_group) {
-        EXPECT_TRUE(v2_group_list.has_value());
-        EXPECT_TRUE(v3_group_list.has_value());
-        EXPECT_EQ(v2_group_list->num_replica_groups(),
-                  expected_num_replica_groups);
-        EXPECT_EQ(v3_group_list->num_replica_groups(),
-                  expected_num_replica_groups);
-        EXPECT_EQ(v2_group_list->num_devices_per_group(),
-                  expected_num_devices_per_group);
-        EXPECT_EQ(v3_group_list->num_devices_per_group(),
-                  expected_num_devices_per_group);
-        EXPECT_EQ(v2_group_list->flattened_replica_groups(),
-                  v3_group_list->flattened_replica_groups());
-      };
   {
     HloSharding sharding = HloSharding::IotaTile({32, 32});
     std::optional<IotaReplicaGroupList> v2_group_list =
@@ -576,24 +632,6 @@ TEST(SPMDPartitionerUtilTest,
 
 TEST(SPMDPartitionerUtilTest,
      ValidateEqualityOfV2AndV3PartitionGroupsForReplication) {
-  auto v2AndV3ReplicaGroupsMatch =
-      [](std::optional<IotaReplicaGroupList> v2_group_list,
-         std::optional<MeshAxesReplicaGroupList> v3_group_list,
-         int64_t expected_num_replica_groups,
-         int64_t expected_num_devices_per_group) {
-        EXPECT_TRUE(v2_group_list.has_value());
-        EXPECT_TRUE(v3_group_list.has_value());
-        EXPECT_EQ(v2_group_list->num_replica_groups(),
-                  expected_num_replica_groups);
-        EXPECT_EQ(v3_group_list->num_replica_groups(),
-                  expected_num_replica_groups);
-        EXPECT_EQ(v2_group_list->num_devices_per_group(),
-                  expected_num_devices_per_group);
-        EXPECT_EQ(v3_group_list->num_devices_per_group(),
-                  expected_num_devices_per_group);
-        EXPECT_EQ(v2_group_list->flattened_replica_groups(),
-                  v3_group_list->flattened_replica_groups());
-      };
   {
     HloSharding sharding = HloSharding::IotaTile({32, 32});
     std::optional<IotaReplicaGroupList> v2_group_list =
@@ -737,9 +775,9 @@ TEST(SPMDPartitionerUtilTest, CanonicalizeShardingV1NonIota) {
   // Create a V1 sharding with non-iota order.
   Array<int64_t> device_assignment({2, 2});
   device_assignment(0, 0) = 0;
-  device_assignment(0, 1) = 2;
+  device_assignment(0, 1) = 3;
   device_assignment(1, 0) = 1;
-  device_assignment(1, 1) = 3;
+  device_assignment(1, 1) = 2;
   HloSharding sharding = HloSharding::Tile(device_assignment);
 
   // Non-iota shardings are also translated using the physical device order.
@@ -747,7 +785,7 @@ TEST(SPMDPartitionerUtilTest, CanonicalizeShardingV1NonIota) {
 
   EXPECT_TRUE(canonicalized.UseNamedShardingLeaf());
   EXPECT_EQ(canonicalized.named_sharding().ToString(),
-            "{mesh['axis_0'=2,'axis_1'=2], device_ids=(0,2,1,3), [{'axis_0'}, "
+            "{mesh['axis_0'=2,'axis_1'=2], device_ids=(0,3,1,2), [{'axis_0'}, "
             "{'axis_1'}]}");
 }
 
