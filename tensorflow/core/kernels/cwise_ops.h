@@ -872,7 +872,7 @@ struct scalar_erf_op<double> {
     constexpr double kClamp = 28.0;
     const Packet x =
         pmin(pmax(a, pset1<Packet>(-kClamp)), pset1<Packet>(kClamp));
-    return perf(x);
+    return pselect(pcmp_eq(a, a), perf(x), a);
   }
 };
 
