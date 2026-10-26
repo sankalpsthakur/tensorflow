@@ -582,6 +582,42 @@ class UnaryOpsTest(xla_test.XLATestCase):
           expected=np.array([1, -4, 2.7, 0], dtype=ctypes[dtype]),
       )
 
+  def testComplexExpInfRealNonFiniteImag(self):
+    # C99 Annex G.6.3.1 / tensorflow#128988: e^-inf dominates an indeterminate
+    # phase, so exp(-inf + I*y) is 0+0j when y is +-inf or NaN. exp(+inf + I*y)
+    # is +inf + NaN*j for those y.
+    inf = np.inf
+    nan = np.nan
+    for dtype in self.complex_types:
+      inp = np.array(
+          [
+              complex(-inf, inf),
+              complex(-inf, -inf),
+              complex(-inf, nan),
+              complex(inf, inf),
+              complex(inf, -inf),
+              complex(inf, nan),
+          ],
+          dtype=dtype,
+      )
+      expected = np.array(
+          [
+              0 + 0j,
+              0 + 0j,
+              0 + 0j,
+              complex(inf, nan),
+              complex(inf, nan),
+              complex(inf, nan),
+          ],
+          dtype=dtype,
+      )
+      self._assertOpOutputMatchesExpected(
+          math_ops.exp,
+          inp,
+          expected=expected,
+          equality_test=self.AssertAllEqual,
+      )
+
   def testIntOps(self):
     for dtype in self.int_types - self.unsigned_int_types:
       self._assertOpOutputMatchesExpected(

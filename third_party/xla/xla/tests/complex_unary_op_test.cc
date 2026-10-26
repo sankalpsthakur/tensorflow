@@ -133,13 +133,12 @@ class ComplexUnaryOpTest : public ClientLibraryTestRunnerMixin<
 };
 
 // Returns true for exp inputs with an infinite real part and a non-finite
-// imaginary part. MLIR's ComplexToStandard lowering of complex.exp (used by
-// the CPU and GPU backends) returns the C99 Annex G values for these inputs
-// since https://github.com/llvm/llvm-project/pull/232791:
-// exp(-inf + I*y) = 0 + 0*I and exp(+inf + I*y) = inf + NaN*I. Before that
-// change, and in complex_unary_op_samples.h, the result is NaN + NaN*I.
-// ExpTest skips these samples; TestExpInfRealNonFiniteImag checks them and
-// accepts either result.
+// imaginary part. complex_unary_op_samples.h still records mpmath's NaN+NaN*I
+// for these points. C99 Annex G.6.3.1 (MLIR ComplexToStandard since
+// llvm/llvm-project#232791, and the elemental IR emitter) returns
+// exp(-inf + I*y) = 0 + 0*I and exp(+inf + I*y) = inf + NaN*I.
+// ExpTest skips these samples; TestExpInfRealNonFiniteImag requires the C99
+// values.
 template <typename T>
 bool IsInfRealNonFiniteImag(const std::complex<T>& z) {
   return std::isinf(z.real()) && !std::isfinite(z.imag());
@@ -196,13 +195,13 @@ void ComplexUnaryOpTest::TestExpInfRealNonFiniteImag() {
                        this->ExecuteAndTransfer(&builder, args));
   for (int64_t i = 0; i < xs.size(); ++i) {
     ComplexT act = actual.Get<ComplexT>({i});
-    const bool is_nan_nan = std::isnan(act.real()) && std::isnan(act.imag());
-    const bool is_c99 = xs[i].real() < 0
-                            ? act.real() == 0 && act.imag() == 0
-                            : std::isinf(act.real()) && std::isnan(act.imag());
-    EXPECT_TRUE(is_nan_nan || is_c99)
-        << "exp(" << xs[i] << ") = " << act
-        << ", expected NaN + NaN*I or the C99 Annex G value";
+    const bool is_c99 =
+        xs[i].real() < 0
+            ? act.real() == 0 && act.imag() == 0
+            : act.real() == inf && std::isnan(act.imag());
+    EXPECT_TRUE(is_c99) << "exp(" << xs[i] << ") = " << act
+                        << ", expected C99 Annex G.6.3.1: 0+0i if Re(z)=-inf, "
+                           "inf+NaN*i if Re(z)=+inf";
   }
 }
 

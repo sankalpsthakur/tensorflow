@@ -793,6 +793,43 @@ class UnaryOpTest(test.TestCase):
           expected, self.evaluate(grad_grad), rtol=1e-14, atol=1e-18
       )
 
+  def testComplexExpInfRealNonFiniteImag(self):
+    # C99 Annex G.6.3.1 / tensorflow#128988: exp(-inf + I*y) = 0+0j and
+    # exp(+inf + I*y) = inf+NaN*j when y is +-inf or NaN.
+    inf = np.inf
+    nan = np.nan
+    for dtype in (np.complex64, np.complex128):
+      x = np.array(
+          [
+              complex(-inf, inf),
+              complex(-inf, -inf),
+              complex(-inf, nan),
+              complex(inf, inf),
+              complex(inf, -inf),
+              complex(inf, nan),
+          ],
+          dtype=dtype,
+      )
+      expected = np.array(
+          [
+              0 + 0j,
+              0 + 0j,
+              0 + 0j,
+              complex(inf, nan),
+              complex(inf, nan),
+              complex(inf, nan),
+          ],
+          dtype=dtype,
+      )
+      with test_util.force_cpu():
+        self.assertAllEqual(
+            expected, self.evaluate(math_ops.exp(constant_op.constant(x)))
+        )
+      with test_util.use_gpu():
+        self.assertAllEqual(
+            expected, self.evaluate(math_ops.exp(constant_op.constant(x)))
+        )
+
   def testRoundIntXLA(self):
     # XLA kernel registers int8, int16, int32, int64.
     @def_function.function(jit_compile=True)

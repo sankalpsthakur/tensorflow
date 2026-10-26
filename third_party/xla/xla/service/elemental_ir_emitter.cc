@@ -1236,9 +1236,11 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitComplexUnaryOp(
     }
     case HloOpcode::kExp: {
       // e^(a+bi) = e^a*(cos(b)+sin(b)i)
-      // Handle special cases as StableHLO implementation does:
+      // Handle special cases as StableHLO / MLIR ComplexToStandard does:
       // 1. When b == 0, set imag(exp(z)) = 0
       // 2. When exp(a) == inf, use exp(a/2) * (cos(b) + I*sin(b)) * exp(a/2)
+      // 3. When a is -inf and b is non-finite: 0 + 0i  (C99 Annex G.6.3.1)
+      // 4. When a is +inf and b is non-finite: +inf + NaN*i
       auto a = EmitExtractReal(operand_value);
       auto b = EmitExtractImag(operand_value);
       auto type = a->getType();
@@ -1266,6 +1268,24 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitComplexUnaryOp(
       auto imag_overflow = FMul(FMul(exp_a_half, sin_b), exp_a_half);
       auto imag_nonzero = Select(exp_a_is_inf, imag_overflow, imag_normal);
       auto imag_result = Select(b_is_zero, zero, imag_nonzero);
+
+      // When a is +-inf and b is +-inf or NaN, exp(a)*cos(b) is inf*NaN or
+      // 0*NaN. C99 Annex G.6.3.1: exp(-inf + I*b) = +-0 +- 0*I and
+      // exp(+inf + I*b) = +-inf + NaN*I. CmpF UGE is true for inf and NaN.
+      // Matches MLIR ComplexToStandard (llvm/llvm-project#232791).
+      if (!b_->getFastMathFlags().noInfs()) {
+        llvm::Value* abs_a = llvm_ir::EmitCallToIntrinsic(
+            llvm::Intrinsic::fabs, {a}, {type}, b_);
+        llvm::Value* abs_b = llvm_ir::EmitCallToIntrinsic(
+            llvm::Intrinsic::fabs, {b}, {type}, b_);
+        auto b_is_not_finite = FCmpUGE(abs_b, pos_inf);
+        auto a_is_inf = FCmpOEQ(abs_a, pos_inf);
+        auto a_is_neg = FCmpOLT(a, zero);
+        auto use_exp_a = And(a_is_inf, b_is_not_finite);
+        auto use_zero_imag = And(use_exp_a, a_is_neg);
+        real_result = Select(use_exp_a, exp_a, real_result);
+        imag_result = Select(use_zero_imag, zero, imag_result);
+      }
 
       return EmitComposeComplex(op, real_result, imag_result, module_, b_);
     }

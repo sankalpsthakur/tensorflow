@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/service/elemental_ir_emitter.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -207,6 +208,41 @@ ENTRY resampler_Resampler.49 {
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(hlo_text, config));
   EXPECT_TRUE(RunAndCompare(std::move(module), ErrorSpec{4e-3, 4e-3}));
+}
+
+TEST_F(ElementalIrEmitterExecutionTest, ComplexExpInfRealNonFiniteImag) {
+  // C99 Annex G.6.3.1: exp(-inf + I*y) = 0+0i and exp(+inf + I*y) = inf+NaN*i
+  // when y is +-inf or NaN. Compared against HloEvaluator (std::exp).
+  const std::string hlo_text = R"(
+HloModule ComplexExpInfRealNonFiniteImag
+
+fused_computation {
+  p0 = c64[6]{0} parameter(0)
+  ROOT exp = c64[6]{0} exponential(p0)
+}
+
+ENTRY main {
+  p0 = c64[6]{0} parameter(0)
+  ROOT fusion = c64[6]{0} fusion(p0), kind=kLoop, calls=fused_computation
+}
+)";
+  const float inf = std::numeric_limits<float>::infinity();
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  Literal input = LiteralUtil::CreateR1<complex64>(
+      {{-inf, -inf},
+       {-inf, inf},
+       {-inf, nan},
+       {inf, -inf},
+       {inf, inf},
+       {inf, nan}});
+  HloModuleConfig config;
+  auto debug_options = GetDebugOptionsForTest();
+  debug_options.set_xla_cpu_fast_math_honor_nans(true);
+  debug_options.set_xla_cpu_fast_math_honor_infs(true);
+  config.set_debug_options(debug_options);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_text, config));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module), {&input}, nullopt));
 }
 
 TEST_F(ElementalIrEmitterExecutionTest,
