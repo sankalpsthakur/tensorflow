@@ -436,6 +436,19 @@ def MHLO_ExpOp: MHLO_UnaryElementwiseOp<"exponential",
   let hasVerifier = 1;
   let hasFolder = 1;
 }
+def MHLO_Exp2Op: MHLO_UnaryElementwiseOp<"exp2",
+    [Pure, HLO_CompatibleOperandsAndResultType], MHLO_FpComplexOrQuantizedIntTensor> {
+  let summary = "Exp2 operation";
+  let description = [{
+    Performs element-wise base-2 exponential operation on `operand` tensor
+    and produces a `result` tensor.
+  }];
+  let arguments = (ins MHLO_FpComplexOrQuantizedIntTensor:$operand,
+                       DefaultValuedOptionalAttr<MHLO_ResultAccuracyAttr,
+                       "::mlir::mhlo::ResultAccuracyMode::DEFAULT">:$result_accuracy);
+  let results = (outs MHLO_FpComplexOrQuantizedIntTensor:$result);
+  let hasVerifier = 1;
+}
 def MHLO_Expm1Op: MHLO_UnaryElementwiseOp<"exponential_minus_one",
     [Pure, HLO_CompatibleOperandsAndResultType], MHLO_FpComplexOrQuantizedIntTensor> {
   let summary = "Expm1 operation";
@@ -553,6 +566,19 @@ def MHLO_Log1pOp: MHLO_UnaryElementwiseOp<"log_plus_one",
     ```mlir
     %result = mhlo.log_plus_one %operand : tensor<6xf32>
     ```
+  }];
+  let arguments = (ins MHLO_FpComplexOrQuantizedIntTensor:$operand,
+                       DefaultValuedOptionalAttr<MHLO_ResultAccuracyAttr,
+                       "::mlir::mhlo::ResultAccuracyMode::DEFAULT">:$result_accuracy);
+  let results = (outs MHLO_FpComplexOrQuantizedIntTensor:$result);
+  let hasVerifier = 1;
+}
+def MHLO_Log2Op: MHLO_UnaryElementwiseOp<"log2",
+    [Pure, HLO_CompatibleOperandsAndResultType], MHLO_FpComplexOrQuantizedIntTensor> {
+  let summary = "Log2 operation";
+  let description = [{
+    Performs element-wise base-2 logarithm operation on `operand` tensor and
+    produces a `result` tensor.
   }];
   let arguments = (ins MHLO_FpComplexOrQuantizedIntTensor:$operand,
                        DefaultValuedOptionalAttr<MHLO_ResultAccuracyAttr,
@@ -2541,6 +2567,52 @@ def MHLO_CollectiveBroadcastOp: MHLO_Op<"collective_broadcast",
       "::mlir::Attribute":$replica_groups)>];
 }
 
+def MHLO_CollectiveReduceOp : MHLO_Op<"collective_reduce", [
+    SingleBlockImplicitTerminator<"ReturnOp">,
+    InferTensorType
+  ]> {
+  let summary = "CollectiveReduce operation";
+  let description = [{
+    Within each process group in the process grid, applies a reduction function
+    `computation` to the values of the operand tensors from each process and
+    writes the reduced result to a single root process (unlike `all_reduce`,
+    which writes the result to every process). The `computation` is applied
+    separately for each data operand, producing one result per data operand.
+
+    The root process is the first member of each replica group by default. When
+    `has_dynamic_root` is set, the last operand is a 1-D `i32` tensor whose
+    length equals the number of data operands and whose values select the root
+    rank for each data operand at run time; that operand is not itself reduced
+    and does not contribute a result.
+
+    This is an MHLO extension without a StableHLO counterpart.
+
+    Example:
+    ```mlir
+    %result = "mhlo.collective_reduce"(%operand) ({
+      ^bb0(%arg0: tensor<f32>, %arg1: tensor<f32>):
+        %0 = mhlo.add %arg0, %arg1 : tensor<f32>
+        mhlo.return %0 : tensor<f32>
+    }) {
+      replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>,
+      channel_handle = #mhlo.channel_handle<handle = 0, type = 0>
+    } : (tensor<4xf32>) -> tensor<4xf32>
+    ```
+  }];
+
+  let arguments = (ins
+    Variadic<MHLO_Tensor>:$operands,
+    MHLO_ReplicaGroups:$replica_groups,
+    OptionalAttr<MHLO_ChannelHandle>:$channel_handle,
+    UnitAttr:$use_global_device_ids,
+    UnitAttr:$has_dynamic_root
+  );
+  let regions = (region SizedRegion<1>:$computation);
+  let results = (outs Variadic<MHLO_Tensor>);
+
+  let hasCustomHLOConverter = 1;
+}
+
 def MHLO_CollectivePermuteOp: MHLO_Op<"collective_permute",
     [Pure, HLO_CompatibleOperandsAndResultType]> {
   let summary = "CollectivePermute operation";
@@ -2993,6 +3065,49 @@ def MHLO_FftOp: MHLO_Op<"fft", [InferTensorType, Pure]> {
   );
 
   let results = (outs MHLO_Tensor);
+}
+
+def MHLO_FmaOp : MHLO_Op<"fma",
+    [Pure, HLO_CompatibleOperandsAndResultType, InferShapedTypeOpInterface,
+     SameOperandsAndResultShape, Elementwise]> {
+  let summary = "Fma operation";
+  let description = [{
+    Performs element-wise single-rounded IEEE-754 fused multiply-add of `a`,
+    `b`, and `c` tensors and produces a `result` tensor.
+
+    See:
+    https://github.com/openxla/stablehlo/blob/main/docs/spec.md#fma
+
+    Example:
+    ```mlir
+    %result = mhlo.fma %a, %b, %c : tensor<3xf32>
+    ```
+  }];
+  let arguments = (ins
+    MHLO_FpTensor:$a,
+    MHLO_FpTensor:$b,
+    MHLO_FpTensor:$c
+  );
+
+  let results = (outs MHLO_FpTensor:$result);
+
+  let extraClassDeclaration = [{
+    LogicalResult reifyReturnTypeShapes(
+        OpBuilder& builder, ValueRange operands,
+        SmallVectorImpl<Value>& reifiedReturnShapes) {
+      return ::mlir::hlo::deriveShapeFromOperand(&builder, getOperation(),
+                                                 operands.front(),
+                                                 &reifiedReturnShapes);
+    }
+    static bool isCompatibleReturnTypes(TypeRange l, TypeRange r) {
+      return mlir::hlo::isCompatibleForHloTypeInference(l, r);
+    }
+  }];
+
+  let assemblyFormat = [{
+    $a `,` $b `,` $c attr-dict
+      `:` custom<SameOperandsAndResultType>(type($a), type($b), type($c), type($result))
+  }];
 }
 
 def MHLO_GatherOp: MHLO_Op<"gather", [InferTensorTypeWithReify, Pure]> {

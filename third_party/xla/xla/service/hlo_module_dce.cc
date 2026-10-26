@@ -18,8 +18,8 @@ limitations under the License.
 #include <deque>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/analysis/hlo_liveness_analysis.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -59,6 +59,15 @@ absl::StatusOr<bool> RunWhileDCE(
         // Only run DCE on tuple-shaped while loops where body root is Tuple,
         // with no I/O instructions.
         VLOG(1) << "WhileDCE SKIP while: " << xla_while->ToString();
+        continue;
+      }
+
+      // TODO(b/260601110) : Bail if any of the computations the while_op uses
+      // are used by something else.
+      if (while_body_comp->caller_instructions().size() > 1 ||
+          xla_while->while_condition()->caller_instructions().size() > 1) {
+        VLOG(1) << "WhileDCE SKIP while: " << xla_while->ToString()
+                << " because while computations are shared.";
         continue;
       }
 

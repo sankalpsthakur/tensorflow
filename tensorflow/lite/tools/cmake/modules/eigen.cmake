@@ -23,7 +23,12 @@ OverridableFetchContent_Declare(
   eigen
   GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
   # Sync with tensorflow/third_party/eigen3/workspace.bzl
-  GIT_TAG ea13a98decd497a8c5588fb5de71b57bcf10d864
+  GIT_TAG 1da510b8155f8fa81924616dcc517ecc4202e4d3
+  # Download a pinned archive from the TensorFlow mirror by default instead of
+  # cloning gitlab.com, which is frequently rate limited on CI. Set
+  # OVERRIDABLE_FETCH_CONTENT_USE_GIT=ON to clone GIT_REPOSITORY instead.
+  URL https://storage.googleapis.com/mirror.tensorflow.org/gitlab.com/libeigen/eigen/-/archive/1da510b8155f8fa81924616dcc517ecc4202e4d3/eigen-1da510b8155f8fa81924616dcc517ecc4202e4d3.tar.gz
+  URL_HASH SHA256=2748cb4820fd0cb99ee8afe0206047fc1217b0935920b0e5001f9084d0abdad0
   # It's not currently (cmake 3.17) possible to shallow clone with a GIT TAG
   # as cmake attempts to git checkout the commit hash after the clone
   # which doesn't work as it's a shallow clone hence a different commit hash.
@@ -99,4 +104,4 @@ set(EIGEN_TEST_SYCL OFF CACHE BOOL "Disable Sycl test")
 set(EIGEN_SYCL_TRISYCL OFF CACHE BOOL "Disable triSYCL test")
 # Make sure only MPL2.0 or more permissively licensed code is included.
 add_compile_definitions(EIGEN_MPL2_ONLY)
-add_subdirectory("${eigen_SOURCE_DIR}" "${eigen_BINARY_DIR}")
+add_subdirectory("${eigen_SOURCE_DIR}" "${eigen_BINARY_DIR}" EXCLUDE_FROM_ALL)

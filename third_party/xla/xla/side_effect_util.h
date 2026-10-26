@@ -80,6 +80,9 @@ extern const char kXlaBufferPlacementParam[];
 extern const char kXlaStreamAnnotationAttr[];
 extern const char kXlaCollectiveStreamAnnotation[];
 
+// XLA frontend attribute for selecting a collective communication domain.
+extern const char kCollectiveCommunicationDomainAttr[];
+
 // XLA frontend attribute for collective matmul control.
 extern const char kXlaCollectiveMatmulAttr[];
 
@@ -109,6 +112,11 @@ extern const char kXlaNoOpSchedulingGroup[];
 extern const char kMustFuseAttr[];
 extern const char kMaximalFuseAttr[];
 extern const char kFuseLimitAttr[];
+extern const char kBufferingLevelAttr[];
+extern const char kOutputWindowBoundsAttr[];
+extern const char kKernelWindowBoundsAttr[];
+extern const char kScopedVmemLimitKibAttr[];
+extern const char kIntegerAttr[];
 extern const char kXlaCseSafeZeroOperandAttr[];
 
 // Frontend attribute asking XLA to launch and schedule independent collectives

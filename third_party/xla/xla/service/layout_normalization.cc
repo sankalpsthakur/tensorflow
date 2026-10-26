@@ -26,10 +26,10 @@ limitations under the License.
 #include "absl/container/inlined_vector.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -844,18 +844,27 @@ class LayoutNormalizationVisitor : public DfsHloRewriteVisitor {
     return HandleTernary(hlo);
   }
 
+  absl::Status HandleFma(HloInstruction* hlo) override {
+    return HandleTernary(hlo);
+  }
+
  private:
-  // Replace clamp/select ternary operation with a normalized one.
+  // Replace clamp/select/fma ternary operation with a normalized one.
   absl::Status HandleTernary(HloInstruction* hlo) {
     Shape s = hlo->shape();
     HloOpcode opcode = hlo->opcode();
-    TF_RET_CHECK(opcode == HloOpcode::kClamp || opcode == HloOpcode::kSelect);
+    TF_RET_CHECK(opcode == HloOpcode::kClamp || opcode == HloOpcode::kSelect ||
+                 opcode == HloOpcode::kFma);
     HloInstruction* arg0 = hlo->mutable_operand(0);
     HloInstruction* arg1 = hlo->mutable_operand(1);
     HloInstruction* arg2 = hlo->mutable_operand(2);
     if (opcode == HloOpcode::kClamp) {
       TF_RET_CHECK(arg1->shape().layout() == s.layout());
     } else if (opcode == HloOpcode::kSelect) {
+      TF_RET_CHECK(arg1->shape().layout() == s.layout());
+      TF_RET_CHECK(arg2->shape().layout() == s.layout());
+    } else if (opcode == HloOpcode::kFma) {
+      TF_RET_CHECK(arg0->shape().layout() == s.layout());
       TF_RET_CHECK(arg1->shape().layout() == s.layout());
       TF_RET_CHECK(arg2->shape().layout() == s.layout());
     } else {

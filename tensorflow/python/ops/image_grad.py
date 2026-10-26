@@ -47,6 +47,65 @@ def _ResizeNearestNeighborGrad(op: ops.Operation, grad):
   return [grads, None]
 
 
+@ops.RegisterGradient("ResizeNearestNeighborGrad")
+def _ResizeNearestNeighborGradGrad(op: ops.Operation, grad):
+  """The transpose of the nearest neighbor resize gradient is a resize."""
+  image = op.inputs[0]
+  if image.get_shape()[1:3].is_fully_defined():
+    image_shape = image.get_shape()[1:3]
+  else:
+    image_shape = array_ops.shape(image)[1:3]
+  return [
+      gen_image_ops.resize_nearest_neighbor(
+          grad,
+          image_shape,
+          align_corners=op.get_attr("align_corners"),
+          half_pixel_centers=op.get_attr("half_pixel_centers"),
+      ),
+      None,
+  ]
+
+
+@ops.RegisterGradient("AdjustContrastv2")
+def _AdjustContrastGrad(op: ops.Operation, grad):
+  """The derivatives for `tf.image.adjust_contrast`.
+
+  The kernel computes `(images - mean) * contrast_factor + mean`, where
+  `mean` is taken per batch and channel over the last three dimensions,
+  which are interpreted as [height, width, channels].
+
+  Args:
+    op: The `AdjustContrastv2` `Operation`.
+    grad: The tensor representing the gradient w.r.t. the output.
+
+  Returns:
+    The gradients w.r.t. the images and the contrast factor.
+  """
+  images = op.inputs[0]
+  factor = op.inputs[1]
+  factor_t = math_ops.cast(factor, images.dtype)
+  static_rank = images.shape.rank
+  if static_rank is not None:
+    spatial_axes = list(range(static_rank - 3, static_rank - 1))
+  else:
+    dynamic_rank = array_ops.rank(images)
+    spatial_axes = math_ops.range(dynamic_rank - 3, dynamic_rank - 1)
+  mean = math_ops.reduce_mean(images, axis=spatial_axes, keepdims=True)
+  grad_images = grad * factor_t + (1.0 - factor_t) * math_ops.reduce_mean(
+      grad,
+      axis=spatial_axes,
+      keepdims=True,
+  )
+  grad_factor = math_ops.reduce_sum(
+      math_ops.cast(grad, dtypes.float32)
+      * (
+          math_ops.cast(images, dtypes.float32)
+          - math_ops.cast(mean, dtypes.float32)
+      )
+  )
+  return grad_images, grad_factor
+
+
 @ops.RegisterGradient("ResizeBilinear")
 def _ResizeBilinearGrad(op: ops.Operation, grad):
   """The derivatives for bilinear resizing.

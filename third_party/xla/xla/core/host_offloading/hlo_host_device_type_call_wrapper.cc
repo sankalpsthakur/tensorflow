@@ -16,8 +16,11 @@ limitations under the License.
 #include "xla/core/host_offloading/hlo_host_device_type_call_wrapper.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
@@ -26,9 +29,9 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/core/host_offloading/annotate_host_compute_offload.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -632,7 +635,24 @@ absl::StatusOr<bool> HloHostDeviceTypeCallWrapper::RunImpl(
 
   ABSL_RETURN_IF_ERROR(
       AnnotateHostComputeOffload().Run(module, execution_threads).status());
-  ABSL_RETURN_IF_ERROR(CallInliner().Run(module, execution_threads).status());
+  std::optional<std::function<CallInliner::InlineOverridePolicy(
+      const CallGraph&, const HloInstruction*)>>
+      override_policy = std::nullopt;
+  if (options_.inline_only_host_computations) {
+    override_policy = [](const CallGraph& /*call_graph*/,
+                         const HloInstruction* instruction) {
+      if (host_offload_utils::ComputeTypeIsHost(instruction) ||
+          absl::c_any_of(instruction->to_apply()->instructions(),
+                         host_offload_utils::ComputeTypeIsHost)) {
+        return CallInliner::InlineOverridePolicy::kAllowInline;
+      }
+      return CallInliner::InlineOverridePolicy::kProhibitInline;
+    };
+  }
+  CallInliner call_inliner(
+      /*single_call_site=*/false, /*update_domain=*/false,
+      /*composites_to_preserve=*/{}, std::move(override_policy));
+  ABSL_RETURN_IF_ERROR(call_inliner.Run(module, execution_threads).status());
   ABSL_RETURN_IF_ERROR(TupleSimplifier().Run(module, execution_threads).status());
   ABSL_RETURN_IF_ERROR(HloDCE().Run(module, execution_threads).status());
 
@@ -641,10 +661,11 @@ absl::StatusOr<bool> HloHostDeviceTypeCallWrapper::RunImpl(
        module->MakeNonfusionComputations({execution_threads})) {
     std::vector<HloInstruction*> callers =
         call_graph->GetComputationCallers(computation);
-    bool caller_is_single_host_instr =
-        callers.size() == 1 &&
-        host_offload_utils::ComputeTypeIsHost(callers.front());
-    if (caller_is_single_host_instr) {
+    bool all_callers_are_host_instrs =
+        !callers.empty() &&
+        absl::c_all_of(callers, host_offload_utils::ComputeTypeIsHost);
+    if (all_callers_are_host_instrs ||
+        call_graph->GetNode(computation).context() == CallContext::kEmbedded) {
       // Skip offloading instructions inside of computations that are already
       // part of an offloaded program (while, conditional, host utility
       // function).

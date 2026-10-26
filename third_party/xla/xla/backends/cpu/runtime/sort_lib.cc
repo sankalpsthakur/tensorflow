@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -27,14 +28,224 @@ limitations under the License.
 #include <vector>
 
 #include "absl/base/attributes.h"
-#include "absl/base/dynamic_annotations.h"
+#include "absl/base/optimization.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/types/span.h"
+#include "xla/types.h"
 
 namespace xla::cpu::internal {
 
 namespace {
+
+template <size_t kBytes>
+using UnsignedKeyType = std::conditional_t<
+    kBytes == 1, uint8_t,
+    std::conditional_t<kBytes == 2, uint16_t,
+                       std::conditional_t<kBytes == 4, uint32_t, uint64_t>>>;
+
+template <typename T>
+inline constexpr bool is_float_type_v =
+    std::is_floating_point_v<T> || std::is_same_v<T, bfloat16> ||
+    std::is_same_v<T, half>;
+
+template <typename T>
+inline bool IsNaN(const T& val) {
+  if constexpr (std::is_same_v<T, double>) {
+    return std::isnan(val);
+  } else if constexpr (std::is_same_v<T, float> ||
+                       std::is_same_v<T, bfloat16> || std::is_same_v<T, half>) {
+    return std::isnan(static_cast<float>(val));
+  } else {
+    return false;
+  }
+}
+
+template <typename T>
+bool LessThanWithNaN(const void** data) {
+  T a;
+  T b;
+  std::memcpy(&a, data[0], sizeof(T));
+  std::memcpy(&b, data[1], sizeof(T));
+  if constexpr (is_float_type_v<T>) {
+    bool a_nan = IsNaN(a);
+    bool b_nan = IsNaN(b);
+    if (a_nan || b_nan) {
+      return !a_nan && b_nan;
+    }
+  }
+  return a < b;
+}
+
+template <typename T>
+bool GreaterThanWithNaN(const void** data) {
+  T a;
+  T b;
+  std::memcpy(&a, data[0], sizeof(T));
+  std::memcpy(&b, data[1], sizeof(T));
+  if constexpr (is_float_type_v<T>) {
+    bool a_nan = IsNaN(a);
+    bool b_nan = IsNaN(b);
+    if (a_nan || b_nan) {
+      return a_nan && !b_nan;
+    }
+  }
+  return a > b;
+}
+
+template <typename Key>
+constexpr UnsignedKeyType<sizeof(Key)> FloatExpMask() {
+  if constexpr (std::is_same_v<Key, half>) {
+    return 0x7c00u;
+  } else if constexpr (std::is_same_v<Key, bfloat16>) {
+    return 0x7f80u;
+  } else if constexpr (std::is_same_v<Key, float>) {
+    return 0x7f800000u;
+  } else {
+    static_assert(std::is_same_v<Key, double>);
+    return 0x7ff0000000000000ull;
+  }
+}
+
+// Encodes IEEE-754 floating-point keys (`half`, `bfloat16`, `float`, `double`)
+// in-place into unsigned integers of the same byte width (`UIntKey`) whose
+// standard unsigned `<` order matches floating-point ascending/descending
+// order:
+//
+// 1. IEEE-754 floats use sign-magnitude representation (`[sign][exp][mant]`).
+//    - Positive floats (`sign == 0`, `0x0000..00` to `0x7f80..00`) already
+//      increase monotonically in raw unsigned bits; flipping only the sign bit
+//      (`u ^ kSignBit`) maps `[+0.0, +Inf]` onto `[0x8000..00, 0xff80..00]`.
+//    - Negative floats (`sign == 1`, `0x8000..00` to `0xff80..00`) increase in
+//      magnitude as their raw unsigned bits increase, which is the reverse of
+//      numeric `<` order; flipping all bits (`u ^ ~0`) reverses their order and
+//      maps `[-Inf, -0.0]` onto `[0x007f..ff, 0x7fff..ff]`.
+// 2. Arithmetic right-shift `static_cast<SIntKey>(u) >> (kBits - 1)` broadcasts
+//    the sign bit across all bits (`0` for positive, `~0` for negative), so
+//    `mask = (signed(u) >> (kBits - 1)) | kSignBit` equals `kSignBit` for
+//    positive floats and `~0` for negative floats without branching.
+// 3. XORing with `dir_xor` (`0` for ascending, `~0` for descending) optionally
+//    inverts all bits (`~x = MAX - x`) so descending sorts can reuse the same
+//    ascending `std::less<UIntKey>` sort instantiation.
+//
+// Returns `true` if no element is `NaN` (`(u & kAbsMask) > exp_mask`) and the
+// slice does not contain both `-0.0` (`u == kSignBit`) and `+0.0` (`u == 0`).
+// Slices containing only `-0.0` (without `+0.0`) or only `+0.0` (without
+// `-0.0`) stay on the fast integer sort path because all zeros in the slice
+// share the same encoded key (`0x7fff..ff` or `0x8000..00`), which lies
+// strictly between all negative and all positive finite numbers. If any `NaN`
+// or both `-0.0` and `+0.0` are present, returns `false` so the caller can
+// restore the original float bits via `DecodeFloatKeys` and fall back to
+// `LessThanWithNaN` / `GreaterThanWithNaN` (preserving `-0.0 == +0.0` stability
+// and XLA's total ordering of negative `NaN`s after `+Inf`).
+template <typename UIntKey>
+bool EncodeFloatKeys(int64_t n, UIntKey* keys, UIntKey dir_xor,
+                     UIntKey exp_mask, int64_t stride = 1) {
+  using SIntKey = std::make_signed_t<UIntKey>;
+  constexpr size_t kBits = sizeof(UIntKey) * 8;
+  constexpr UIntKey kSignBit = UIntKey{1} << (kBits - 1);
+  constexpr UIntKey kAbsMask = kSignBit - 1;
+
+  UIntKey has_nan = 0;
+  UIntKey has_neg_zero = 0;
+  UIntKey has_pos_zero = 0;
+  if (stride == 1) {
+    for (int64_t i = 0; i < n; ++i) {
+      UIntKey u;
+      std::memcpy(&u, &keys[i], sizeof(UIntKey));
+      has_nan |= static_cast<UIntKey>((u & kAbsMask) > exp_mask);
+      has_neg_zero |= static_cast<UIntKey>(u == kSignBit);
+      has_pos_zero |= static_cast<UIntKey>(u == 0);
+      UIntKey mask =
+          static_cast<UIntKey>(static_cast<SIntKey>(u) >> (kBits - 1)) |
+          kSignBit;
+      u = (u ^ mask) ^ dir_xor;
+      std::memcpy(&keys[i], &u, sizeof(UIntKey));
+    }
+  } else {
+    for (int64_t i = 0; i < n; ++i) {
+      UIntKey u;
+      std::memcpy(&u, &keys[i * stride], sizeof(UIntKey));
+      has_nan |= static_cast<UIntKey>((u & kAbsMask) > exp_mask);
+      has_neg_zero |= static_cast<UIntKey>(u == kSignBit);
+      has_pos_zero |= static_cast<UIntKey>(u == 0);
+      UIntKey mask =
+          static_cast<UIntKey>(static_cast<SIntKey>(u) >> (kBits - 1)) |
+          kSignBit;
+      u = (u ^ mask) ^ dir_xor;
+      std::memcpy(&keys[i * stride], &u, sizeof(UIntKey));
+    }
+  }
+  return (has_nan | (has_neg_zero & has_pos_zero)) == 0;
+}
+
+// Exact inverse of `EncodeFloatKeys`: after undoing `dir_xor`, encoded negative
+// floats have `MSB == 0` and encoded positive floats have `MSB == 1`, so
+// `(~static_cast<SIntKey>(u) >> (kBits - 1)) | kSignBit` reconstructs the same
+// per-element `mask` (`~0` for negative floats, `kSignBit` for positive floats)
+// and `u ^ mask` restores the original IEEE-754 bit pattern in-place.
+template <typename UIntKey>
+void DecodeFloatKeys(int64_t n, UIntKey* keys, UIntKey dir_xor,
+                     int64_t stride = 1) {
+  using SIntKey = std::make_signed_t<UIntKey>;
+  constexpr size_t kBits = sizeof(UIntKey) * 8;
+  constexpr UIntKey kSignBit = UIntKey{1} << (kBits - 1);
+
+  if (stride == 1) {
+    for (int64_t i = 0; i < n; ++i) {
+      UIntKey u;
+      std::memcpy(&u, &keys[i], sizeof(UIntKey));
+      u ^= dir_xor;
+      UIntKey mask =
+          static_cast<UIntKey>(~static_cast<SIntKey>(u) >> (kBits - 1)) |
+          kSignBit;
+      u ^= mask;
+      std::memcpy(&keys[i], &u, sizeof(UIntKey));
+    }
+  } else {
+    for (int64_t i = 0; i < n; ++i) {
+      UIntKey u;
+      std::memcpy(&u, &keys[i * stride], sizeof(UIntKey));
+      u ^= dir_xor;
+      UIntKey mask =
+          static_cast<UIntKey>(~static_cast<SIntKey>(u) >> (kBits - 1)) |
+          kSignBit;
+      u ^= mask;
+      std::memcpy(&keys[i * stride], &u, sizeof(UIntKey));
+    }
+  }
+}
+
+// Applies a self-inverse bitwise XOR mask (`(u ^ xor_mask) ^ xor_mask == u`)
+// in-place before and after sorting integral keys as unsigned integers:
+// - For two's-complement signed integers (`int8_t`..`int64_t`), flipping the
+//   MSB (`kSignBit`) shifts `[INT_MIN, INT_MAX]` monotonically onto
+//   `[0, UINT_MAX]` so unsigned `<` matches signed `<`.
+// - For descending order, flipping all bits (`dir_xor = ~0`, i.e. `MAX - u`)
+//   reverses unsigned `<` order (`~a < ~b <=> a > b`).
+// - Because XOR is associative, `xor_mask = sign_bit_mask ^ dir_xor` combines
+//   both transforms into a single pass.
+template <typename UIntKey>
+void XorKeys(int64_t n, UIntKey* keys, UIntKey xor_mask, int64_t stride = 1) {
+  if (xor_mask == 0) {
+    return;
+  }
+  if (stride == 1) {
+    for (int64_t i = 0; i < n; ++i) {
+      UIntKey u;
+      std::memcpy(&u, &keys[i], sizeof(UIntKey));
+      u ^= xor_mask;
+      std::memcpy(&keys[i], &u, sizeof(UIntKey));
+    }
+  } else {
+    for (int64_t i = 0; i < n; ++i) {
+      UIntKey u;
+      std::memcpy(&u, &keys[i * stride], sizeof(UIntKey));
+      u ^= xor_mask;
+      std::memcpy(&keys[i * stride], &u, sizeof(UIntKey));
+    }
+  }
+}
 
 // We use a lot of template metaprogramming below to be able to construct
 // iterators with statically known number of compared elements. We support a
@@ -43,8 +254,14 @@ namespace {
 // The size of the largest element we support (std::complex<double>).
 static constexpr size_t kMaxElementSize = 16;
 
-// Type erased storage suitable for storing any primitive type.
-using ValueStorage = std::array<std::byte, kMaxElementSize>;
+// Type erased storage suitable for storing any primitive type. Use
+// `alignas(std::max_align_t)` (16 on Linux x86_64, 8 on Windows x64) rather
+// than `alignas(kMaxElementSize)` so `Value<n>` does not exceed
+// `alignof(max_align_t)` on Windows x64 MSVC (`std::stable_sort`'s internal
+// `std::aligned_storage` buffer triggers a static_assert for extended
+// alignment unless `_ENABLE_EXTENDED_ALIGNED_STORAGE` is defined).
+struct alignas(std::max_align_t) ValueStorage
+    : std::array<std::byte, kMaxElementSize> {};
 
 // Pointers to the input arrays together with their primitive sizes.
 template <size_t n>
@@ -99,12 +316,12 @@ class DInputs {
 
   std::byte* ptr(size_t i, size_t offset) const {
     DCHECK_LT(i, n_) << "Input index out of bounds";
-    auto& [ptr, primitive_size] = ptrs_and_primitive_sizes_.data()[i];
+    auto& [ptr, primitive_size] = ptrs_and_primitive_sizes_[i];
     return ptr + offset * primitive_size;
   }
 
   size_t primitive_size(size_t i) const {
-    return ptrs_and_primitive_sizes_.data()[i].second;
+    return ptrs_and_primitive_sizes_[i].second;
   }
 
  private:
@@ -254,7 +471,7 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE void Value<n>::FillComparedValues(
 
 ABSL_ATTRIBUTE_ALWAYS_INLINE DValue::DValue(const DRef& ref) : values(ref.n()) {
   for (size_t i = 0, end = ref.n(); i < end; ++i) {
-    Memcpy(values.data()[i].data(), ref.ptr(i), ref.primitive_size(i));
+    Memcpy(values[i].data(), ref.ptr(i), ref.primitive_size(i));
   }
 }
 
@@ -270,7 +487,7 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE void DValue::FillComparedValues(
 template <size_t n>
 ABSL_ATTRIBUTE_ALWAYS_INLINE Ref<n>& Ref<n>::operator=(const Value<n>& value) {
   for (size_t i = 0; i < n; ++i) {
-    Memcpy(ptr(i), value.values.data()[i].data(), primitive_size(i));
+    Memcpy(ptr(i), value.values[i].data(), primitive_size(i));
   }
   return *this;
 }
@@ -295,7 +512,7 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE void Ref<n>::FillComparedValues(
 
 ABSL_ATTRIBUTE_ALWAYS_INLINE DRef& DRef::operator=(const DValue& value) {
   for (size_t i = 0, end = n(); i < end; ++i) {
-    Memcpy(ptr(i), value.values.data()[i].data(), primitive_size(i));
+    Memcpy(ptr(i), value.values[i].data(), primitive_size(i));
   }
   return *this;
 }
@@ -493,13 +710,286 @@ class SortIterator {
   difference_type stride_ = 1;
 };
 
-}  // namespace
+template <typename Key, typename Value>
+struct ZipRef {
+  Key& key;
+  Value& value;
+
+  ZipRef(Key& k, Value& v) : key(k), value(v) {}
+  ZipRef(const ZipRef&) = default;
+
+  // Non-defaulted copy assignment is required to write through to referenced
+  // memory (defaulted assignment is implicitly deleted on reference members).
+  // NOLINTNEXTLINE(modernize-use-equals-default)
+  ZipRef& operator=(const ZipRef& other) {
+    key = other.key;
+    value = other.value;
+    return *this;
+  }
+
+  ZipRef& operator=(const std::pair<Key, Value>& p) {
+    key = p.first;
+    value = p.second;
+    return *this;
+  }
+
+  ZipRef& operator=(std::pair<Key, Value>&& p) {
+    key = std::move(p.first);
+    value = std::move(p.second);
+    return *this;
+  }
+
+  // Implicit conversion to std::pair is required by std::sort / STL algorithms
+  // for copy-initialization of temporary value_type variables (e.g. pivots).
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  operator std::pair<Key, Value>() const { return {key, value}; }
+
+  friend void swap(ZipRef a, ZipRef b) noexcept {
+    std::swap(a.key, b.key);
+    std::swap(a.value, b.value);
+  }
+
+  friend void swap(ZipRef a, std::pair<Key, Value>& b) noexcept {
+    std::swap(a.key, b.first);
+    std::swap(a.value, b.second);
+  }
+
+  friend void swap(std::pair<Key, Value>& a, ZipRef b) noexcept {
+    std::swap(a.first, b.key);
+    std::swap(a.second, b.value);
+  }
+};
+
+template <typename Key, typename Value>
+class ZipIterator {
+ public:
+  using iterator_category = std::random_access_iterator_tag;
+  using value_type = std::pair<Key, Value>;
+  using difference_type = std::ptrdiff_t;
+  using reference = ZipRef<Key, Value>;
+  // Required by std::iterator_traits in C++17 for proxy iterators.
+  using pointer = void;
+
+  ZipIterator() : key_ptr_(nullptr), val_ptr_(nullptr) {}
+  ZipIterator(Key* key_ptr, Value* val_ptr)
+      : key_ptr_(key_ptr), val_ptr_(val_ptr) {}
+
+  reference operator*() const { return reference(*key_ptr_, *val_ptr_); }
+  reference operator[](difference_type n) const {
+    return reference(key_ptr_[n], val_ptr_[n]);
+  }
+
+  ZipIterator& operator++() {
+    ++key_ptr_;
+    ++val_ptr_;
+    return *this;
+  }
+  ZipIterator operator++(int) {
+    ZipIterator tmp = *this;
+    ++(*this);
+    return tmp;
+  }
+  ZipIterator& operator--() {
+    --key_ptr_;
+    --val_ptr_;
+    return *this;
+  }
+  ZipIterator operator--(int) {
+    ZipIterator tmp = *this;
+    --(*this);
+    return tmp;
+  }
+
+  ZipIterator& operator+=(difference_type n) {
+    key_ptr_ += n;
+    val_ptr_ += n;
+    return *this;
+  }
+  ZipIterator& operator-=(difference_type n) {
+    key_ptr_ -= n;
+    val_ptr_ -= n;
+    return *this;
+  }
+
+  friend ZipIterator operator+(ZipIterator it, difference_type n) {
+    return it += n;
+  }
+  friend ZipIterator operator+(difference_type n, ZipIterator it) {
+    return it += n;
+  }
+  friend ZipIterator operator-(ZipIterator it, difference_type n) {
+    return it -= n;
+  }
+  friend difference_type operator-(const ZipIterator& a, const ZipIterator& b) {
+    return a.key_ptr_ - b.key_ptr_;
+  }
+
+  friend bool operator==(const ZipIterator& a, const ZipIterator& b) {
+    return a.key_ptr_ == b.key_ptr_;
+  }
+  friend bool operator!=(const ZipIterator& a, const ZipIterator& b) {
+    return a.key_ptr_ != b.key_ptr_;
+  }
+  friend bool operator<(const ZipIterator& a, const ZipIterator& b) {
+    return a.key_ptr_ < b.key_ptr_;
+  }
+  friend bool operator>(const ZipIterator& a, const ZipIterator& b) {
+    return a.key_ptr_ > b.key_ptr_;
+  }
+  friend bool operator<=(const ZipIterator& a, const ZipIterator& b) {
+    return a.key_ptr_ <= b.key_ptr_;
+  }
+  friend bool operator>=(const ZipIterator& a, const ZipIterator& b) {
+    return a.key_ptr_ >= b.key_ptr_;
+  }
+
+  Key* key_ptr() const { return key_ptr_; }
+  Value* val_ptr() const { return val_ptr_; }
+
+  friend void iter_swap(ZipIterator a, ZipIterator b) noexcept {
+    std::swap(*a.key_ptr_, *b.key_ptr_);
+    std::swap(*a.val_ptr_, *b.val_ptr_);
+  }
+
+ private:
+  Key* key_ptr_;
+  Value* val_ptr_;
+};
+
+template <typename Key, typename Value, typename SliceSorter>
+static void Sort2DSlices(const SortDims& sort_dims, int64_t start_slice,
+                         int64_t end_slice, Key* keys, Value* values,
+                         SliceSorter&& sort_slice) {
+  DCHECK_LE(0, start_slice);
+  DCHECK_LE(start_slice, end_slice);
+  DCHECK_LE(end_slice, sort_dims.outer_dim_size * sort_dims.inner_dim_size);
+
+  int64_t n = sort_dims.sort_dim_size;
+  if (sort_dims.inner_dim_size == 1) {
+    for (int64_t i = start_slice; i < end_slice; ++i) {
+      int64_t offset = i * n;
+      sort_slice(n, keys + offset, values + offset);
+    }
+    return;
+  }
+
+  // Strided case (inner_dim_size > 1): Gather into contiguous arrays (SoA),
+  // sort with contiguous ZipIterator, and scatter back.
+  DCHECK_GT(sort_dims.inner_dim_size, 0);
+  int64_t stride = sort_dims.inner_dim_size;
+  auto sort_strided_slice = [&](int64_t offset, Key* key_buf, Value* val_buf) {
+    Key* key_ptr = keys + offset;
+    Value* val_ptr = values + offset;
+    for (int64_t i = 0; i < n; ++i) {
+      key_buf[i] = key_ptr[i * stride];
+      val_buf[i] = val_ptr[i * stride];
+    }
+    sort_slice(n, key_buf, val_buf);
+    for (int64_t i = 0; i < n; ++i) {
+      key_ptr[i * stride] = key_buf[i];
+      val_ptr[i * stride] = val_buf[i];
+    }
+  };
+
+  int64_t slice_stride = n * stride;
+  int64_t outer = start_slice / stride;
+  int64_t inner = start_slice % stride;
+  int64_t offset = outer * slice_stride + inner;
+
+  auto run_slices = [&](Key* key_buf, Value* val_buf) {
+    for (int64_t i = start_slice; i < end_slice; ++i) {
+      sort_strided_slice(offset, key_buf, val_buf);
+      if (++inner == stride) {
+        inner = 0;
+        offset += slice_stride - stride + 1;
+      } else {
+        ++offset;
+      }
+    }
+  };
+
+  if (n <= 1024) {
+    std::array<Key, 1024> key_buf;
+    std::array<Value, 1024> val_buf;
+    run_slices(key_buf.data(), val_buf.data());
+  } else {
+    std::vector<Key> key_buf(n);
+    std::vector<Value> val_buf(n);
+    run_slices(key_buf.data(), val_buf.data());
+  }
+}
+
+template <typename Key, typename Value>
+static void Sort2DSliceWithComparator(int64_t n, Key* keys, Value* values,
+                                      bool is_stable, LessThan* less_than) {
+  auto comp = [&](const auto& a, const auto& b) -> bool {
+    auto get_ptrs =
+        [](const auto& item) -> std::pair<const void*, const void*> {
+      using T = std::decay_t<decltype(item)>;
+      if constexpr (std::is_same_v<T, std::pair<Key, Value>>) {
+        return {&item.first, &item.second};
+      } else {
+        return {&item.key, &item.value};
+      }
+    };
+    auto [a0, a1] = get_ptrs(a);
+    auto [b0, b1] = get_ptrs(b);
+    const void* values_ptrs[4] = {a0, b0, a1, b1};
+    return (*less_than)(values_ptrs);
+  };
+
+  ZipIterator<Key, Value> begin(keys, values);
+  ZipIterator<Key, Value> end(keys + n, values + n);
+  if (is_stable) {
+    std::stable_sort(begin, end, comp);
+  } else {
+    std::sort(begin, end, comp);
+  }
+}
+
+template <typename Key, typename Value>
+static void Sort2DWithComparator(const SortDims& sort_dims, int64_t start_slice,
+                                 int64_t end_slice, Key* keys, Value* values,
+                                 bool is_stable, LessThan* less_than) {
+  Sort2DSlices(sort_dims, start_slice, end_slice, keys, values,
+               [is_stable, less_than](int64_t n, Key* k, Value* v) {
+                 Sort2DSliceWithComparator<Key, Value>(n, k, v, is_stable,
+                                                       less_than);
+               });
+}
+
+// Dispatches to a generic functor parameterized by an unsigned integer type
+// of matching byte size (uint8_t, uint16_t, uint32_t, uint64_t).
+//
+// When sorting with a non-inlined `less_than` comparator callback, comparisons
+// are delegated via `const void*` pointers, so the sort algorithm does not need
+// semantic type information (e.g. float vs int32_t). The types are only used
+// for pointer arithmetic and data movement (swapping and temporary pivot copies
+// on the stack). Because all trivially copyable types of the same byte width
+// share the same size, alignment, and copy semantics, unsigned integers are
+// binary-compatible stand-ins, avoiding the need to instantiate templates for
+// every semantic type combination.
+template <typename Fn>
+bool DispatchBySize(size_t size, Fn&& fn) {
+  switch (size) {
+    case 1:
+      return fn(uint8_t{});
+    case 2:
+      return fn(uint16_t{});
+    case 4:
+      return fn(uint32_t{});
+    case 8:
+      return fn(uint64_t{});
+    default:
+      return false;
+  }
+}
 
 template <size_t n>
-static void Sort1DInplace(const SortDims& sort_dims, int64_t offset,
-                          absl::Span<std::byte* const> data,
-                          absl::Span<const size_t> primitive_sizes,
-                          bool is_stable, LessThan* less_than) {
+void Sort1DInplace(const SortDims& sort_dims, int64_t offset,
+                   absl::Span<std::byte* const> data,
+                   absl::Span<const size_t> primitive_sizes, bool is_stable,
+                   LessThan* less_than) {
   DCHECK_EQ(n, data.size());
   DCHECK_EQ(n, primitive_sizes.size());
 
@@ -526,10 +1016,10 @@ static void Sort1DInplace(const SortDims& sort_dims, int64_t offset,
   }
 }
 
-static void DSort1DInplace(const SortDims& sort_dims, int64_t offset,
-                           absl::Span<std::byte* const> data,
-                           absl::Span<const size_t> primitive_sizes,
-                           bool is_stable, LessThan* less_than) {
+void DSort1DInplace(const SortDims& sort_dims, int64_t offset,
+                    absl::Span<std::byte* const> data,
+                    absl::Span<const size_t> primitive_sizes, bool is_stable,
+                    LessThan* less_than) {
   DCHECK_EQ(data.size(), primitive_sizes.size());
 
   std::vector<std::byte*> ptrs(data.size());
@@ -558,20 +1048,144 @@ static void DSort1DInplace(const SortDims& sort_dims, int64_t offset,
   }
 }
 
-// Sorts `data` using `less_than` comparator function.
-void SortInplace(const SortDims& sort_dims, absl::Span<std::byte* const> data,
+template <typename UIntKey>
+void Sort1DUnsignedInplace(const SortDims& sort_dims, int64_t offset,
+                           UIntKey* data, bool is_stable) {
+  UIntKey* begin = data + offset;
+  if (sort_dims.inner_dim_size == 1) {
+    UIntKey* end = begin + sort_dims.sort_dim_size;
+    if (is_stable) {
+      std::stable_sort(begin, end, std::less<UIntKey>());
+    } else {
+      std::sort(begin, end, std::less<UIntKey>());
+    }
+  } else {
+    using Iterator = internal::SortIterator<UIntKey, UIntKey&, UIntKey*>;
+    Iterator begin_it(begin, /*stride=*/sort_dims.inner_dim_size);
+    Iterator end_it = begin_it + sort_dims.sort_dim_size;
+    if (is_stable) {
+      std::stable_sort(begin_it, end_it, std::less<UIntKey>());
+    } else {
+      std::sort(begin_it, end_it, std::less<UIntKey>());
+    }
+  }
+}
+
+template <typename T>
+void Sort1DInplace(const SortDims& sort_dims, int64_t offset, T* data,
+                   bool is_stable, SortDirection direction) {
+  using UIntKey = UnsignedKeyType<sizeof(T)>;
+  constexpr UIntKey kSignBit = UIntKey{1} << (sizeof(UIntKey) * 8 - 1);
+  UIntKey dir_xor =
+      direction == SortDirection::kAscending ? UIntKey{0} : ~UIntKey{0};
+  UIntKey* udata = reinterpret_cast<UIntKey*>(data);
+  int64_t n = sort_dims.sort_dim_size;
+  int64_t stride = sort_dims.inner_dim_size;
+
+  if constexpr (std::is_integral_v<T>) {
+    UIntKey xor_mask = (std::is_signed_v<T> ? kSignBit : UIntKey{0}) ^ dir_xor;
+    XorKeys(n, udata + offset, xor_mask, stride);
+    Sort1DUnsignedInplace<UIntKey>(sort_dims, offset, udata, is_stable);
+    XorKeys(n, udata + offset, xor_mask, stride);
+  } else {
+    if (ABSL_PREDICT_TRUE(EncodeFloatKeys(n, udata + offset, dir_xor,
+                                          FloatExpMask<T>(), stride))) {
+      Sort1DUnsignedInplace<UIntKey>(sort_dims, offset, udata, is_stable);
+      DecodeFloatKeys(n, udata + offset, dir_xor, stride);
+    } else {
+      DecodeFloatKeys(n, udata + offset, dir_xor, stride);
+      std::byte* raw_ptr = reinterpret_cast<std::byte*>(data);
+      size_t elem_size = sizeof(T);
+      LessThan less_than = direction == SortDirection::kAscending
+                               ? &LessThanWithNaN<T>
+                               : &GreaterThanWithNaN<T>;
+      Sort1DInplace<1>(sort_dims, offset, absl::MakeConstSpan(&raw_ptr, 1),
+                       absl::MakeConstSpan(&elem_size, 1), is_stable,
+                       &less_than);
+    }
+  }
+}
+
+template <typename UIntKey, typename Value>
+void SortKeyValueSlice(int64_t n, UIntKey* keys, Value* values,
+                       bool is_stable) {
+  auto comp = [](const auto& a, const auto& b) -> bool {
+    auto get_key = [](const auto& item) -> UIntKey {
+      using T = std::decay_t<decltype(item)>;
+      if constexpr (std::is_same_v<T, std::pair<UIntKey, Value>>) {
+        return item.first;
+      } else {
+        return item.key;
+      }
+    };
+    return get_key(a) < get_key(b);
+  };
+
+  ZipIterator<UIntKey, Value> begin(keys, values);
+  ZipIterator<UIntKey, Value> end(keys + n, values + n);
+  if (is_stable) {
+    std::stable_sort(begin, end, comp);
+  } else {
+    std::sort(begin, end, comp);
+  }
+}
+
+template <typename UIntKey, typename Value>
+void Sort2DUnsignedKeyValue(const SortDims& sort_dims, int64_t start_slice,
+                            int64_t end_slice, UIntKey* keys, Value* values,
+                            bool is_stable, UIntKey xor_mask, UIntKey exp_mask,
+                            bool (*fallback_less_than)(const void**)) {
+  Sort2DSlices(sort_dims, start_slice, end_slice, keys, values,
+               [is_stable, xor_mask, exp_mask, fallback_less_than](
+                   int64_t n, UIntKey* k, Value* v) {
+                 if (fallback_less_than == nullptr) {
+                   XorKeys(n, k, xor_mask);
+                   SortKeyValueSlice<UIntKey, Value>(n, k, v, is_stable);
+                   XorKeys(n, k, xor_mask);
+                 } else if (ABSL_PREDICT_TRUE(
+                                EncodeFloatKeys(n, k, xor_mask, exp_mask))) {
+                   SortKeyValueSlice<UIntKey, Value>(n, k, v, is_stable);
+                   DecodeFloatKeys(n, k, xor_mask);
+                 } else {
+                   DecodeFloatKeys(n, k, xor_mask);
+                   LessThan less_than = fallback_less_than;
+                   Sort2DSliceWithComparator<UIntKey, Value>(n, k, v, is_stable,
+                                                             &less_than);
+                 }
+               });
+}
+
+}  // namespace
+
+// Sorts `data` using `less_than` comparator function for slices in
+// [start_slice, end_slice).
+void SortInplace(const SortDims& sort_dims, int64_t start_slice,
+                 int64_t end_slice, absl::Span<std::byte* const> data,
                  absl::Span<const size_t> primitive_sizes, bool is_stable,
                  LessThan* less_than) {
-  // Iterate over all the 1-dimensional slices of the buffers and sort them.
-  int64_t num_iterations = sort_dims.outer_dim_size * sort_dims.inner_dim_size;
+  DCHECK_LE(0, start_slice);
+  DCHECK_LE(start_slice, end_slice);
+  DCHECK_LE(end_slice, sort_dims.outer_dim_size * sort_dims.inner_dim_size);
+  DCHECK_EQ(data.size(), primitive_sizes.size());
 
-  // Annotate memory that might have been initialized by jit-compiled code.
-  for (int64_t i = 0; i < data.size(); ++i) {
-    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(
-        data[i], primitive_sizes[i] * sort_dims.sort_dim_size * num_iterations);
+  if (data.size() == 2 &&
+      (sort_dims.inner_dim_size == 1 || sort_dims.sort_dim_size <= 65536)) {
+    bool dispatched = DispatchBySize(primitive_sizes[0], [&](auto key_dummy) {
+      using Key = decltype(key_dummy);
+      return DispatchBySize(primitive_sizes[1], [&](auto val_dummy) {
+        using Value = decltype(val_dummy);
+        Sort2DWithComparator<Key, Value>(
+            sort_dims, start_slice, end_slice, reinterpret_cast<Key*>(data[0]),
+            reinterpret_cast<Value*>(data[1]), is_stable, less_than);
+        return true;
+      });
+    });
+    if (dispatched) {
+      return;
+    }
   }
 
-  for (int64_t i = 0; i < num_iterations; ++i) {
+  for (int64_t i = start_slice; i < end_slice; ++i) {
     int64_t inner_idx = i % sort_dims.inner_dim_size;
     int64_t offset = inner_idx + (i - inner_idx) * sort_dims.sort_dim_size;
 
@@ -639,51 +1253,15 @@ void SortInplace(const SortDims& sort_dims, absl::Span<std::byte* const> data,
   }
 }
 
-template <class Iterator, class T>
-static void Sort1DInplace(Iterator begin, Iterator end, bool is_stable,
-                          SortDirection direction) {
-  if (direction == SortDirection::kAscending) {
-    if (is_stable) {
-      std::stable_sort(begin, end, std::less<T>());
-    } else {
-      std::sort(begin, end, std::less<T>());
-    }
-  } else {
-    if (is_stable) {
-      std::stable_sort(begin, end, std::greater<T>());
-    } else {
-      std::sort(begin, end, std::greater<T>());
-    }
-  };
-}
-
 template <typename T>
-static void Sort1DInplace(const SortDims& sort_dims, int64_t offset, T* data,
-                          bool is_stable, SortDirection direction) {
-  T* begin = data + offset;
-  T* end = begin + sort_dims.sort_dim_size;
-
-  if (sort_dims.inner_dim_size == 1) {
-    Sort1DInplace<T*, T>(begin, end, is_stable, direction);
-  } else {
-    using Iterator = internal::SortIterator<T, T&, T*>;
-    Iterator begin_it(begin, /*stride=*/sort_dims.inner_dim_size);
-    Iterator end_it = begin_it + sort_dims.sort_dim_size;
-    Sort1DInplace<Iterator, T>(begin_it, end_it, is_stable, direction);
-  }
-}
-
-template <typename T>
-void SortInplace(const SortDims& sort_dims, T* data, bool is_stable,
+void SortInplace(const SortDims& sort_dims, int64_t start_slice,
+                 int64_t end_slice, T* data, bool is_stable,
                  SortDirection direction) {
-  // Iterate over all the 1-dimensional slices of the buffers and sort them.
-  int64_t num_iterations = sort_dims.outer_dim_size * sort_dims.inner_dim_size;
+  DCHECK_LE(0, start_slice);
+  DCHECK_LE(start_slice, end_slice);
+  DCHECK_LE(end_slice, sort_dims.outer_dim_size * sort_dims.inner_dim_size);
 
-  // Annotate memory that might have been initialized by jit-compiled code.
-  ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(
-      data, sizeof(T) * sort_dims.sort_dim_size * num_iterations);
-
-  for (int64_t i = 0; i < num_iterations; ++i) {
+  for (int64_t i = start_slice; i < end_slice; ++i) {
     int64_t inner_idx = i % sort_dims.inner_dim_size;
     int64_t offset = inner_idx + (i - inner_idx) * sort_dims.sort_dim_size;
 
@@ -691,13 +1269,16 @@ void SortInplace(const SortDims& sort_dims, T* data, bool is_stable,
   }
 }
 
-// Declare Sort1DInplace for all supported types. Template is instantiated in
+// Declare SortInplace for all supported types. Template is instantiated in
 // the .cc file.
-#define DEFINE_SORT_INPLACE(T) \
-  template void SortInplace<T>(const SortDims&, T*, bool, SortDirection)
+#define DEFINE_SORT_INPLACE(T)                                              \
+  template void SortInplace<T>(const SortDims&, int64_t, int64_t, T*, bool, \
+                               SortDirection)
 
 DEFINE_SORT_INPLACE(float);
 DEFINE_SORT_INPLACE(double);
+DEFINE_SORT_INPLACE(bfloat16);
+DEFINE_SORT_INPLACE(half);
 DEFINE_SORT_INPLACE(int8_t);
 DEFINE_SORT_INPLACE(int16_t);
 DEFINE_SORT_INPLACE(int32_t);
@@ -708,5 +1289,58 @@ DEFINE_SORT_INPLACE(uint32_t);
 DEFINE_SORT_INPLACE(uint64_t);
 
 #undef DEFINE_SORT_INPLACE
+
+template <typename Key, typename Value>
+void Sort2DKeyValue(const SortDims& sort_dims, int64_t start_slice,
+                    int64_t end_slice, Key* keys, Value* values, bool is_stable,
+                    SortDirection direction) {
+  using UIntKey = UnsignedKeyType<sizeof(Key)>;
+  constexpr UIntKey kSignBit = UIntKey{1} << (sizeof(UIntKey) * 8 - 1);
+  UIntKey dir_xor =
+      direction == SortDirection::kAscending ? UIntKey{0} : ~UIntKey{0};
+  UIntKey* ukeys = reinterpret_cast<UIntKey*>(keys);
+
+  if constexpr (std::is_integral_v<Key>) {
+    UIntKey xor_mask =
+        (std::is_signed_v<Key> ? kSignBit : UIntKey{0}) ^ dir_xor;
+    Sort2DUnsignedKeyValue<UIntKey, Value>(sort_dims, start_slice, end_slice,
+                                           ukeys, values, is_stable, xor_mask,
+                                           /*exp_mask=*/0,
+                                           /*fallback_less_than=*/nullptr);
+  } else {
+    bool (*fallback_less_than)(const void**) =
+        direction == SortDirection::kAscending ? &LessThanWithNaN<Key>
+                                               : &GreaterThanWithNaN<Key>;
+    Sort2DUnsignedKeyValue<UIntKey, Value>(
+        sort_dims, start_slice, end_slice, ukeys, values, is_stable, dir_xor,
+        FloatExpMask<Key>(), fallback_less_than);
+  }
+}
+
+#define DEFINE_SORT_2D_KEY_VALUE(Key, Value)                                  \
+  template void Sort2DKeyValue<Key, Value>(const SortDims&, int64_t, int64_t, \
+                                           Key*, Value*, bool, SortDirection)
+
+#define DEFINE_SORT_2D_KEY_VALUE_KEY(Key)  \
+  DEFINE_SORT_2D_KEY_VALUE(Key, uint8_t);  \
+  DEFINE_SORT_2D_KEY_VALUE(Key, uint16_t); \
+  DEFINE_SORT_2D_KEY_VALUE(Key, uint32_t); \
+  DEFINE_SORT_2D_KEY_VALUE(Key, uint64_t)
+
+DEFINE_SORT_2D_KEY_VALUE_KEY(float);
+DEFINE_SORT_2D_KEY_VALUE_KEY(double);
+DEFINE_SORT_2D_KEY_VALUE_KEY(bfloat16);
+DEFINE_SORT_2D_KEY_VALUE_KEY(half);
+DEFINE_SORT_2D_KEY_VALUE_KEY(int8_t);
+DEFINE_SORT_2D_KEY_VALUE_KEY(int16_t);
+DEFINE_SORT_2D_KEY_VALUE_KEY(int32_t);
+DEFINE_SORT_2D_KEY_VALUE_KEY(int64_t);
+DEFINE_SORT_2D_KEY_VALUE_KEY(uint8_t);
+DEFINE_SORT_2D_KEY_VALUE_KEY(uint16_t);
+DEFINE_SORT_2D_KEY_VALUE_KEY(uint32_t);
+DEFINE_SORT_2D_KEY_VALUE_KEY(uint64_t);
+
+#undef DEFINE_SORT_2D_KEY_VALUE_KEY
+#undef DEFINE_SORT_2D_KEY_VALUE
 
 }  // namespace xla::cpu::internal

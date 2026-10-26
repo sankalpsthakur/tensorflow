@@ -34,15 +34,20 @@ limitations under the License.
 #include "xla/hlo/transforms/simplifiers/algebraic_simplifier.h"
 #include "xla/hlo/transforms/simplifiers/hlo_memory_scheduler.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
+#include "xla/pjrt/c/pjrt_c_api_status_utils.h"
 #include "xla/pjrt/c/pjrt_c_api_xla_transform_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_xla_transform_internal.h"
 #include "xla/service/computation_layout.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_cse.h"
+#include "xla/service/hlo_module_config.h"
+#include "xla/service/hlo_verifier.h"
 #include "xla/shape.h"
 #include "xla/shape_layout.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/lib/strings/proto_serialization.h"
+#include "xla/xla.pb.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 
@@ -740,6 +745,246 @@ TEST_F(UpdateHloModuleFromProtoTest, PreservesAliasAndDonorConfigs) {
 
   EXPECT_TRUE(module->input_output_alias_config().ParameterHasAlias(0, {}));
   EXPECT_TRUE(module->buffer_donor_config().ParameterIsBufferDonor(0, {}));
+}
+
+TEST_F(XlaTransformTest, GetHloPassPipelineTrace) {
+  // 1. Create the XLA transform extension.
+  PJRT_Xla_Transform_Extension extension = pjrt::CreateXlaTransformExtension();
+  ASSERT_NE(extension.get_hlo_pass_pipeline_trace, nullptr);
+
+  // 2. Prepare a test HLO module.
+  absl::string_view hlo_text = R"(
+    HloModule test_module
+    ENTRY test_computation {
+      p0 = f32[] parameter(0)
+      ROOT add = f32[] add(p0, p0)
+    }
+  )";
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo_text));
+
+  xla::HloModuleProto proto = module->ToProto();
+  std::string serialized_proto;
+  ASSERT_TRUE(tsl::SerializeToStringDeterministic(proto, &serialized_proto));
+
+  // 3. Prepare arguments.
+  PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace_Args args;
+  args.struct_size =
+      PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace_Args_STRUCT_SIZE;
+  args.hlo_module.data = serialized_proto.data();
+  args.hlo_module.size = serialized_proto.size();
+
+  // 4. Call get_hlo_pass_pipeline_trace.
+  PJRT_Error* error = extension.get_hlo_pass_pipeline_trace(&args);
+  ASSERT_EQ(error, nullptr);
+
+  // 5. Verify and print the trace.
+  EXPECT_NE(args.trace.serialized_trace, nullptr);
+  EXPECT_GT(args.trace.serialized_trace_size, 0);
+
+  xla::HloModuleMetadataProto metadata_proto;
+  ASSERT_TRUE(metadata_proto.ParseFromString(absl::string_view(
+      args.trace.serialized_trace, args.trace.serialized_trace_size)));
+
+  LOG(INFO) << "=== Captured HLO Pass Pipeline Trace ===";
+  LOG(INFO) << "Module ID: " << metadata_proto.canonical_module_id();
+  LOG(INFO) << "Passes run:";
+  for (const auto& pass_metadata : metadata_proto.pass_metadata()) {
+    LOG(INFO) << "  - Pass: " << pass_metadata.pass_name()
+              << " (Pipeline: " << pass_metadata.pipeline_name()
+              << ", changed: "
+              << (pass_metadata.module_changed() ? "yes" : "no") << ")";
+  }
+  LOG(INFO) << "=========================================";
+
+  // 6. Clean up.
+  PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace_Args destroy_args;
+  destroy_args.struct_size =
+      PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace_Args_STRUCT_SIZE;
+  destroy_args.trace = &args.trace;
+  extension.destroy_hlo_pass_pipeline_trace(&destroy_args);
+
+  EXPECT_EQ(args.trace.serialized_trace, nullptr);
+  EXPECT_EQ(args.trace.serialized_trace_size, 0);
+}
+
+TEST_F(XlaTransformTest, GetHloPassPipelineTraceValidationAndErrorHandling) {
+  PJRT_Xla_Transform_Extension extension = pjrt::CreateXlaTransformExtension();
+
+  // Test 1: Null args
+  PJRT_Error* err1 = extension.get_hlo_pass_pipeline_trace(nullptr);
+  EXPECT_NE(err1, nullptr);
+  pjrt::DestroyPjRtError(err1);
+
+  // Test 2: Invalid struct size
+  PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace_Args args;
+  args.struct_size = 0;
+  PJRT_Error* err2 = extension.get_hlo_pass_pipeline_trace(&args);
+  EXPECT_NE(err2, nullptr);
+  pjrt::DestroyPjRtError(err2);
+
+  // Test 3: Invalid serialized proto
+  args.struct_size =
+      PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace_Args_STRUCT_SIZE;
+  std::string invalid_proto = "not a valid proto";
+  args.hlo_module.data = invalid_proto.data();
+  args.hlo_module.size = invalid_proto.size();
+  PJRT_Error* err3 = extension.get_hlo_pass_pipeline_trace(&args);
+  EXPECT_NE(err3, nullptr);
+  pjrt::DestroyPjRtError(err3);
+
+  // Test 4: Destroy with null args or null trace
+  extension.destroy_hlo_pass_pipeline_trace(nullptr);
+
+  PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace_Args destroy_args;
+  destroy_args.struct_size =
+      PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace_Args_STRUCT_SIZE;
+  destroy_args.trace = nullptr;
+  extension.destroy_hlo_pass_pipeline_trace(&destroy_args);
+}
+
+TEST_F(XlaTransformTest, ApplyTransformsCustomVerifierMetadata) {
+  absl::string_view hlo_text = R"(
+    HloModule test_module, num_partitions=2
+    ENTRY main {
+      ROOT p0 = f32[4] parameter(0), sharding={devices=[4]0,1,2,3}
+    }
+  )";
+
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       xla::ParseAndReturnUnverifiedModule(hlo_text));
+  module->mutable_config().set_use_spmd_partitioning(true);
+
+  auto transform = std::make_shared<TrivialTransform>("trivial_transform");
+  RegisterHloXlaTransform(HloXlaTransform::PipelineStage::kPreScheduler,
+                          transform);
+
+  // Default verifier should reject this module because
+  // verify_sharding_device_numbers is true and num_partitions (2) != sharding
+  // device count (4).
+  {
+    ASSERT_OK_AND_ASSIGN(auto clone,
+                         xla::ParseAndReturnUnverifiedModule(hlo_text));
+    clone->mutable_config().set_use_spmd_partitioning(true);
+    HloPassPipeline default_pipeline("default_pipeline");
+    default_pipeline.AddPass<ApplyXlaTransforms>(
+        HloXlaTransform::PipelineStage::kPreScheduler);
+    EXPECT_FALSE(default_pipeline.Run(clone.get()).ok());
+  }
+
+  // With custom TargetVerifierMetadata (with
+  // verify_sharding_device_numbers=false), ApplyXlaTransforms succeeds.
+  {
+    HloPassPipeline custom_pipeline("custom_pipeline");
+    auto verifier_metadata = std::make_unique<DefaultVerifierMetadata>(
+        HloVerifierOpts{}.WithVerifyShardingDeviceNumbers(false));
+    custom_pipeline.AddPass<ApplyXlaTransforms>(
+        HloXlaTransform::PipelineStage::kPreScheduler,
+        std::move(verifier_metadata));
+    ASSERT_OK_AND_ASSIGN(bool changed, custom_pipeline.Run(module.get()));
+    EXPECT_TRUE(changed);
+  }
+}
+
+struct ModuleConfigCapture {
+  int calls = 0;
+  bool struct_covers_module_config = false;
+  bool parsed = false;
+  HloModuleConfigProto config;
+};
+ModuleConfigCapture* module_config_capture = nullptr;
+
+void CaptureModuleConfigCallback(PJRT_XlaTransform_Callbacks* callbacks,
+                                 PJRT_XlaTransform_Args* args) {
+  ++module_config_capture->calls;
+  module_config_capture->struct_covers_module_config =
+      args->struct_size >=
+      PJRT_STRUCT_SIZE(PJRT_XlaTransform_Args, hlo_module_config);
+  if (module_config_capture->struct_covers_module_config) {
+    module_config_capture->parsed =
+        module_config_capture->config.ParseFromString(absl::string_view(
+            args->hlo_module_config.data, args->hlo_module_config.size));
+  }
+  args->changed = false;
+  args->header.has_error = false;
+}
+
+ModuleConfigCapture ApplyCaptureModuleConfigTransform(HloModule* module) {
+  ModuleConfigCapture capture;
+  module_config_capture = &capture;
+
+  PJRT_XlaTransform_Callbacks callbacks;
+  callbacks.version = PJRT_API_XLA_TRANSFORM_EXTENSION_VERSION;
+  callbacks.dtor = nullptr;
+  callbacks.transform_hlo_module = CaptureModuleConfigCallback;
+
+  PJRT_Xla_Transform_Extension extension = pjrt::CreateXlaTransformExtension();
+  constexpr absl::string_view kName = "capture_module_config";
+
+  PJRT_Register_Xla_Transform_Args reg_args;
+  reg_args.struct_size = PJRT_Register_Xla_Transform_Args_STRUCT_SIZE;
+  reg_args.name = kName.data();
+  reg_args.name_size = kName.size();
+  reg_args.stage = PJRT_XlaTransform_PipelineStage_kPreScheduler;
+  reg_args.callbacks = &callbacks;
+  EXPECT_EQ(extension.register_xla_transform(&reg_args), nullptr);
+
+  absl::StatusOr<bool> changed = ApplyXlaTransformsToModule(
+      HloXlaTransform::PipelineStage::kPreScheduler, module);
+  EXPECT_TRUE(changed.ok());
+  EXPECT_FALSE(changed.value_or(true));
+
+  PJRT_Clear_Xla_Transform_Args clear_args;
+  clear_args.struct_size = PJRT_Clear_Xla_Transform_Args_STRUCT_SIZE;
+  clear_args.stage = PJRT_XlaTransform_PipelineStage_kPreScheduler;
+  clear_args.name = kName.data();
+  clear_args.name_size = kName.size();
+  clear_args.callbacks = nullptr;
+  clear_args.cleared = false;
+  EXPECT_EQ(extension.clear_xla_transform(&clear_args), nullptr);
+  EXPECT_TRUE(clear_args.cleared);
+
+  module_config_capture = nullptr;
+  return capture;
+}
+
+TEST_F(XlaTransformTest, PjrtCApiExtensionPassesModuleConfig) {
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+    HloModule test_module
+    ENTRY test_computation {
+      p0 = f32[] parameter(0)
+      ROOT add = f32[] add(p0, p0)
+    }
+  )"));
+  const std::string fdo_profile("fdo\0profile", 11);
+  module->mutable_config().set_fdo_profile(fdo_profile);
+  module->mutable_config().set_replica_count(4);
+  module->mutable_config().mutable_debug_options().set_xla_dump_to("/tmp/dump");
+
+  ModuleConfigCapture capture = ApplyCaptureModuleConfigTransform(module.get());
+
+  EXPECT_EQ(capture.calls, 1);
+  EXPECT_TRUE(capture.struct_covers_module_config);
+  ASSERT_TRUE(capture.parsed);
+  EXPECT_EQ(capture.config.fdo_profile(), fdo_profile);
+  EXPECT_EQ(capture.config.replica_count(), 4);
+  EXPECT_EQ(capture.config.debug_options().xla_dump_to(), "/tmp/dump");
+}
+
+TEST_F(XlaTransformTest, PjrtCApiExtensionEmptyFdoProfileInModuleConfig) {
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+    HloModule test_module
+    ENTRY test_computation {
+      p0 = f32[] parameter(0)
+      ROOT add = f32[] add(p0, p0)
+    }
+  )"));
+
+  ModuleConfigCapture capture = ApplyCaptureModuleConfigTransform(module.get());
+
+  EXPECT_EQ(capture.calls, 1);
+  EXPECT_TRUE(capture.struct_covers_module_config);
+  ASSERT_TRUE(capture.parsed);
+  EXPECT_TRUE(capture.config.fdo_profile().empty());
 }
 
 }  // namespace

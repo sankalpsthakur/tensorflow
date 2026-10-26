@@ -21,16 +21,16 @@ limitations under the License.
 #include <vector>
 
 #include "absl/log/log.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/client/executable_build_options.h"
 #include "xla/hlo/builder/xla_computation.h"
 #include "xla/service/backend.h"
 #include "xla/service/compiler.h"
 #include "xla/service/computation_layout.h"
-#include "xla/service/computation_placer.h"
+#include "xla/service/device_assignment.h"
 #include "xla/service/executable.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/local_service_utils.h"

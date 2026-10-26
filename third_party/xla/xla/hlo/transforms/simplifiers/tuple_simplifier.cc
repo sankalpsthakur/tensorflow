@@ -19,9 +19,9 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
@@ -36,6 +36,10 @@ TupleSimplifier::TupleSimplifier(bool exclude_entry_computation)
 
 absl::StatusOr<HloInstruction*> TupleSimplifier::RemoveWholeTuple(
     HloInstruction* tuple) {
+  if (tuple->get_frontend_attribute(kDisableTupleSimplifierAttribute) ==
+      "true") {
+    return nullptr;
+  }
   HloInstruction* top_tuple = nullptr;
   for (int64_t operand_number = 0; operand_number < tuple->operand_count();
        ++operand_number) {

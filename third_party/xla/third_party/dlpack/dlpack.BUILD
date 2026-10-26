@@ -16,6 +16,8 @@
 # Description:
 #   DLPack is a protocol for sharing arrays between deep learning frameworks.
 
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
 licenses(["notice"])  # Apache 2
 
 exports_files(["LICENSE"])
@@ -25,5 +27,6 @@ cc_library(
     hdrs = [
         "include/dlpack/dlpack.h",
     ],
+    includes = ["include"],
     visibility = ["//visibility:public"],
 )

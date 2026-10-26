@@ -22,10 +22,10 @@ limitations under the License.
 
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
@@ -215,8 +215,10 @@ absl::Status LoopEmitter::EmitLoop(absl::string_view loop_name,
 
   // Set the insertion point of b_ to the loop exit, so that
   // code emitted for later instructions will be correctly placed.
+  // Insert before any instructions the loop emission split off into the
+  // exit block (e.g. a terminator), not at the block's end.
   if (exit_bb_ != nullptr) {
-    b_->SetInsertPoint(exit_bb_);
+    b_->SetInsertPoint(exit_bb_, exit_bb_->getFirstInsertionPt());
   }
   return absl::OkStatus();
 }

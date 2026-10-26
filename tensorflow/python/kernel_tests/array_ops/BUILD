@@ -299,9 +299,11 @@ cuda_py_strict_test(
     tags = ["no_windows_gpu"],
     deps = [
         "//tensorflow/core/protobuf:for_core_protos_py_proto",
+        "//tensorflow/python/eager:def_function",
         "//tensorflow/python/framework:constant_op",
         "//tensorflow/python/framework:errors",
         "//tensorflow/python/framework:for_generated_wrappers",
+        "//tensorflow/python/framework:tensor_spec",
         "//tensorflow/python/framework:test_lib",
         "//tensorflow/python/ops:array_ops",
         "//tensorflow/python/ops:gradient_checker",
@@ -477,6 +479,18 @@ cuda_py_strict_test(
     deps = [
         "//tensorflow/python/framework:for_generated_wrappers",
         "//tensorflow/python/ops:array_ops",
+        "//tensorflow/python/platform:client_testlib",
+    ],
+)
+
+tf_py_strict_test(
+    name = "large_mirror_pad_op_test",
+    size = "medium",
+    srcs = ["large_mirror_pad_op_test.py"],
+    deps = [
+        "//tensorflow/python/framework:for_generated_wrappers",
+        "//tensorflow/python/ops:array_ops",
+        "//tensorflow/python/ops:math_ops",
         "//tensorflow/python/platform:client_testlib",
     ],
 )
@@ -702,6 +716,7 @@ cuda_py_strict_test(
         "//tensorflow/python/framework:for_generated_wrappers",
         "//tensorflow/python/framework:test_lib",
         "//tensorflow/python/ops:array_ops",
+        "//tensorflow/python/ops:array_ops_gen",
         "//tensorflow/python/ops:gradients_impl",
         "//tensorflow/python/ops:math_ops",
         "//tensorflow/python/ops:nn_ops",

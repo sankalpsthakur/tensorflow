@@ -25,12 +25,11 @@ limitations under the License.
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
-#include "llvm/Support/ExtensibleRTTI.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/pjrt/host_memory_spaces.h"
@@ -50,6 +49,7 @@ limitations under the License.
 #include "xla/python/ifrt/layout.h"
 #include "xla/python/ifrt/memory.h"
 #include "xla/python/ifrt/remap_plan.h"
+#include "xla/python/ifrt/rtti.h"
 #include "xla/python/ifrt/shape.h"
 #include "xla/python/ifrt/sharding.h"
 #include "xla/python/ifrt/topology.h"
@@ -60,7 +60,7 @@ limitations under the License.
 #include "xla/python/pjrt_ifrt/pjrt_dtype.h"
 #include "xla/python/pjrt_ifrt/pjrt_layout.h"
 #include "xla/python/pjrt_ifrt/pjrt_topology.h"
-#include "xla/service/computation_placer.h"
+#include "xla/service/device_assignment.h"
 #include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/concurrency/ref_count.h"
 #include "xla/tsl/platform/statusor.h"
@@ -70,7 +70,7 @@ limitations under the License.
 namespace xla {
 
 class CompileOnlyMemory
-    : public llvm::RTTIExtends<CompileOnlyMemory, ifrt::Memory> {
+    : public xla::ifrt::RTTIExtends<CompileOnlyMemory, ifrt::Memory> {
  public:
   explicit CompileOnlyMemory(
       int id, const PjRtMemorySpaceDescription* memory_description,
@@ -102,7 +102,7 @@ class CompileOnlyMemory
 };
 
 class CompileOnlyDevice
-    : public llvm::RTTIExtends<CompileOnlyDevice, ifrt::Device> {
+    : public xla::ifrt::RTTIExtends<CompileOnlyDevice, ifrt::Device> {
  public:
   explicit CompileOnlyDevice(const PjRtDeviceDescription* description,
                              absl::string_view platform_name)
@@ -165,7 +165,7 @@ class CompileOnlyDevice
 };
 
 class CompileOnlyIfRtClient final
-    : public llvm::RTTIExtends<CompileOnlyIfRtClient, ifrt::Client> {
+    : public xla::ifrt::RTTIExtends<CompileOnlyIfRtClient, ifrt::Client> {
  public:
   explicit CompileOnlyIfRtClient(std::shared_ptr<ifrt::PjRtTopology> topology)
       : topology_(std::move(topology)),
@@ -219,6 +219,14 @@ class CompileOnlyIfRtClient final
         "MakeErrorArrays not available with compile-only client.");
   }
 
+  absl::StatusOr<std::vector<tsl::Future<>>> CopyArraysToHostBufferShards(
+      absl::Span<CopyArraysToHostBufferShardsSpec> specs,
+      ifrt::ArrayCopySemantics semantics) override {
+    return absl::UnimplementedError(
+        "CopyArraysToHostBufferShards not available with compile-only "
+        "client");
+  }
+
   absl::StatusOr<ifrt::ArrayRef> AssembleArrayFromSingleDeviceArrays(
       ifrt::DType dtype, ifrt::Shape shape, ifrt::ShardingRef sharding,
       absl::Span<ifrt::ArrayRef> arrays,
@@ -235,6 +243,14 @@ class CompileOnlyIfRtClient final
       std::optional<ifrt::MemoryKind> memory_kind,
       ifrt::ArrayCopySemantics semantics) override {
     return Unimplemented("CopyArrays not available with compile-only client.");
+  }
+
+  absl::StatusOr<std::vector<ifrt::ArrayRef>> CopyArraysWithDonatedDst(
+      absl::Span<ifrt::ArrayRef> arrays,
+      absl::Span<ifrt::ArrayRef> donated_dst_arrays,
+      ifrt::ArrayCopySemantics semantics) override {
+    return Unimplemented(
+        "CopyArraysWithDonatedDst not available with compile-only client.");
   }
 
   absl::StatusOr<std::vector<ifrt::ArrayRef>> RemapArrays(
@@ -346,6 +362,12 @@ class CompileOnlyIfRtClient final
   }
 
   ifrt::Compiler* GetDefaultCompiler() override { return &default_compiler_; }
+
+  absl::StatusOr<std::vector<tsl::Future<ifrt::LoadedExecutableRef>>> Load(
+      absl::Span<const ifrt::ExecutableRef> executables,
+      absl::Span<std::unique_ptr<ifrt::LoadOptions>> options) override {
+    return Unimplemented("Load not available with compile-only client.");
+  }
 
   static char ID;  // NOLINT
 

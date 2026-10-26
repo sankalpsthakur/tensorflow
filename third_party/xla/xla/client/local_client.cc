@@ -24,10 +24,10 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/client/executable_build_options.h"
 #include "xla/debug_options_flags.h"
 #include "xla/executable_run_options.h"
@@ -194,6 +194,11 @@ LocalExecutable::RunHelper(const absl::Span<const Shape* const> argument_shapes,
     }
   }
 
+  return PrepareRunOptions(std::move(run_options));
+}
+
+absl::StatusOr<std::pair<ServiceExecutableRunOptions, StreamPool::Ptr>>
+LocalExecutable::PrepareRunOptions(ExecutableRunOptions run_options) {
   ABSL_RETURN_IF_ERROR(ValidateExecutionOptions(run_options, *backend_));
 
   StreamPool::Ptr stream;

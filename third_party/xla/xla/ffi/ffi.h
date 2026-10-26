@@ -41,10 +41,10 @@ limitations under the License.
 #include "absl/base/optimization.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/executable_run_options.h"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/c_api_internal.h"  // IWYU pragma: keep
@@ -723,6 +723,11 @@ static std::optional<T> DecodeInternalCtx(const XLA_FFI_Api* api,
 }
 
 }  // namespace internal
+
+// Decode per-execution custom options using the same dictionary interface.
+template <>
+struct CtxDecoding<CustomOptions>
+    : internal::CustomOptionsDecoding<Dictionary> {};
 
 template <>
 struct CtxDecoding<DeviceOrdinal> {

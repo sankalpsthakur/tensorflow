@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
-load("@local_config_cuda//cuda:build_defs.bzl", "cuda_library")
+load("@local_config_cuda//cuda:build_defs.bzl", "cuda_library", "if_cuda")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_test")
 
@@ -45,15 +45,18 @@ cuda_library(
 xla_cc_test(
     name = "sm_bw_test",
     srcs = ["sm_bw_test.cc"],
+    copts = if_cuda(["-DGOOGLE_CUDA=1"]),
     tags = [
         "cuda-only",
         "gpu",
-        "requires-gpu-nvidia",
+        "nomsan",
+        "requires-gpu-sm90",
     ],
     deps = [
         ":sm_bw_kernels",
         ":sm_bw_utils",
         "//xla/tsl/cuda:cudart",
+        "@com_google_absl//absl/log",
         "@com_google_googletest//:gtest_main",
     ],
 )

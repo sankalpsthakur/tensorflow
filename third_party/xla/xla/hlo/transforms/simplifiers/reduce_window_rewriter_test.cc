@@ -116,15 +116,15 @@ ENTRY entry (arg: f32[46592]) -> f32[46592] {
   CheckReduceWindowRewrite(hlo, R"(
 // CHECK: ENTRY %entry (arg: f32[46592]) -> f32[46592] {
 // CHECK-NEXT:  [[arg_0:%[^ ]+]] = f32[46592]{0} parameter(0)
-// CHECK-NEXT:  [[reshape_1:%[^ ]+]] = f32[364,128]{0,1} reshape([[arg_0]])
+// CHECK-NEXT:  [[reshape_1:%[^ ]+]] = f32[364,128]{1,0} reshape([[arg_0]])
 // CHECK-NEXT:  [[constant_2:%[^ ]+]] = f32[] constant(0)
-// CHECK-NEXT:  [[reduce_window_1_3:%[^ ]+]] = f32[364,128]{0,1} reduce-window([[reshape_1]], [[constant_2]]), window={size=1x128 pad=0_0x127_0}, to_apply=[[add_float_4:%[^ ]+]]
-// CHECK-NEXT:  [[slice_5:%[^ ]+]] = f32[364,1]{0,1} slice([[reduce_window_1_3]]), slice={[0:364], [127:128]}
+// CHECK-NEXT:  [[reduce_window_1_3:%[^ ]+]] = f32[364,128]{1,0} reduce-window([[reshape_1]], [[constant_2]]), window={size=1x128 pad=0_0x127_0}, to_apply=[[add_float_4:%[^ ]+]]
+// CHECK-NEXT:  [[slice_5:%[^ ]+]] = f32[364,1]{1,0} slice([[reduce_window_1_3]]), slice={[0:364], [127:128]}
 // CHECK-NEXT:  [[reshape_1_6:%[^ ]+]] = f32[364]{0} reshape([[slice_5]])
 // CHECK-NEXT:  [[reduce_window_2_7:%[^ ]+]] = f32[365]{0} reduce-window([[reshape_1_6]], [[constant_2]]), window={size=364 pad=364_0}, to_apply=[[add_float_4]]
 // CHECK-NEXT:  [[slice_1_8:%[^ ]+]] = f32[364]{0} slice([[reduce_window_2_7]]), slice={[0:364]}
-// CHECK-NEXT:  [[broadcast_9:%[^ ]+]] = f32[364,128]{0,1} broadcast([[slice_1_8]]), dimensions={0}
-// CHECK-NEXT:  [[map_10:%[^ ]+]] = f32[364,128]{0,1} map([[reduce_window_1_3]], [[broadcast_9]]), dimensions={0,1}, to_apply=[[add_float_4]]
+// CHECK-NEXT:  [[broadcast_9:%[^ ]+]] = f32[364,128]{1,0} broadcast([[slice_1_8]]), dimensions={0}
+// CHECK-NEXT:  [[map_10:%[^ ]+]] = f32[364,128]{1,0} map([[reduce_window_1_3]], [[broadcast_9]]), dimensions={0,1}, to_apply=[[add_float_4]]
 // CHECK-NEXT:  ROOT [[reshape_2_11:%[^ ]+]] = f32[46592]{0} reshape([[map_10]])
 // CHECK-NEXT:}
 )");
@@ -156,30 +156,30 @@ ENTRY entry (arg_0: f32[46592], arg_1: f32[46592]) -> (f32[46592], f32[46592]) {
   CheckReduceWindowRewrite(hlo_string, R"(
 // CHECK: ENTRY %entry (arg.0: f32[46592], arg.1: f32[46592]) -> (f32[46592], f32[46592]) {
 // CHECK-NEXT:   [[arg_0_0:%[^ ]+]] = f32[46592]{0} parameter(0)
-// CHECK-NEXT:   [[reshape_1:%[^ ]+]] = f32[364,128]{0,1} reshape([[arg_0_0]])
+// CHECK-NEXT:   [[reshape_1:%[^ ]+]] = f32[364,128]{1,0} reshape([[arg_0_0]])
 // CHECK-NEXT:   [[arg_1_2:%[^ ]+]] = f32[46592]{0} parameter(1)
-// CHECK-NEXT:   [[reshape_1_3:%[^ ]+]] = f32[364,128]{0,1} reshape([[arg_1_2]])
+// CHECK-NEXT:   [[reshape_1_3:%[^ ]+]] = f32[364,128]{1,0} reshape([[arg_1_2]])
 // CHECK-NEXT:   [[init_ninf_4:%[^ ]+]] = f32[] constant(-inf)
 // CHECK-NEXT:   [[init_inf_5:%[^ ]+]] = f32[] constant(inf)
-// CHECK-NEXT:   [[reduce_window_1_6:%[^ ]+]] = (f32[364,128]{0,1}, f32[364,128]{0,1}) reduce-window([[reshape_1]], [[reshape_1_3]], [[init_ninf_4]], [[init_inf_5]]), window={size=1x128 pad=0_0x127_0}, to_apply=[[MaxMin_7:%[^ ]+]]
-// CHECK-NEXT:   [[get_tuple_element_4_8:%[^ ]+]] = f32[364,128]{0,1} get-tuple-element([[reduce_window_1_6]]), index=0
-// CHECK-NEXT:   [[get_tuple_element_5_9:%[^ ]+]] = f32[364,128]{0,1} get-tuple-element([[reduce_window_1_6]]), index=1
-// CHECK-NEXT:   [[get_tuple_element_10:%[^ ]+]] = f32[364,128]{0,1} get-tuple-element([[reduce_window_1_6]]), index=0
-// CHECK-NEXT:   [[slice_11:%[^ ]+]] = f32[364,1]{0,1} slice([[get_tuple_element_10]]), slice={[0:364], [127:128]}
+// CHECK-NEXT:   [[reduce_window_1_6:%[^ ]+]] = (f32[364,128]{1,0}, f32[364,128]{1,0}) reduce-window([[reshape_1]], [[reshape_1_3]], [[init_ninf_4]], [[init_inf_5]]), window={size=1x128 pad=0_0x127_0}, to_apply=[[MaxMin_7:%[^ ]+]]
+// CHECK-NEXT:   [[get_tuple_element_4_8:%[^ ]+]] = f32[364,128]{1,0} get-tuple-element([[reduce_window_1_6]]), index=0
+// CHECK-NEXT:   [[get_tuple_element_5_9:%[^ ]+]] = f32[364,128]{1,0} get-tuple-element([[reduce_window_1_6]]), index=1
+// CHECK-NEXT:   [[get_tuple_element_10:%[^ ]+]] = f32[364,128]{1,0} get-tuple-element([[reduce_window_1_6]]), index=0
+// CHECK-NEXT:   [[slice_11:%[^ ]+]] = f32[364,1]{1,0} slice([[get_tuple_element_10]]), slice={[0:364], [127:128]}
 // CHECK-NEXT:   [[reshape_2_12:%[^ ]+]] = f32[364]{0} reshape([[slice_11]])
-// CHECK-NEXT:   [[get_tuple_element_1_13:%[^ ]+]] = f32[364,128]{0,1} get-tuple-element([[reduce_window_1_6]]), index=1
-// CHECK-NEXT:   [[slice_1_14:%[^ ]+]] = f32[364,1]{0,1} slice([[get_tuple_element_1_13]]), slice={[0:364], [127:128]}
+// CHECK-NEXT:   [[get_tuple_element_1_13:%[^ ]+]] = f32[364,128]{1,0} get-tuple-element([[reduce_window_1_6]]), index=1
+// CHECK-NEXT:   [[slice_1_14:%[^ ]+]] = f32[364,1]{1,0} slice([[get_tuple_element_1_13]]), slice={[0:364], [127:128]}
 // CHECK-NEXT:   [[reshape_3_15:%[^ ]+]] = f32[364]{0} reshape([[slice_1_14]])
 // CHECK-NEXT:   [[reduce_window_2_16:%[^ ]+]] = (f32[365]{0}, f32[365]{0}) reduce-window([[reshape_2_12]], [[reshape_3_15]], [[init_ninf_4]], [[init_inf_5]]), window={size=364 pad=364_0}, to_apply=[[MaxMin_7]]
 // CHECK-NEXT:   [[get_tuple_element_2_17:%[^ ]+]] = f32[365]{0} get-tuple-element([[reduce_window_2_16]]), index=0
 // CHECK-NEXT:   [[slice_2_18:%[^ ]+]] = f32[364]{0} slice([[get_tuple_element_2_17]]), slice={[0:364]}
-// CHECK-NEXT:   [[broadcast_19:%[^ ]+]] = f32[364,128]{0,1} broadcast([[slice_2_18]]), dimensions={0}
+// CHECK-NEXT:   [[broadcast_19:%[^ ]+]] = f32[364,128]{1,0} broadcast([[slice_2_18]]), dimensions={0}
 // CHECK-NEXT:   [[get_tuple_element_3_20:%[^ ]+]] = f32[365]{0} get-tuple-element([[reduce_window_2_16]]), index=1
 // CHECK-NEXT:   [[slice_3_21:%[^ ]+]] = f32[364]{0} slice([[get_tuple_element_3_20]]), slice={[0:364]}
-// CHECK-NEXT:   [[broadcast_1_22:%[^ ]+]] = f32[364,128]{0,1} broadcast([[slice_3_21]]), dimensions={0}
-// CHECK-NEXT:   [[map_23:%[^ ]+]] = f32[364,128]{0,1} map([[get_tuple_element_4_8]], [[get_tuple_element_5_9]], [[broadcast_19]], [[broadcast_1_22]]), dimensions={0,1}, to_apply=[[MaxMin_7]].clone
+// CHECK-NEXT:   [[broadcast_1_22:%[^ ]+]] = f32[364,128]{1,0} broadcast([[slice_3_21]]), dimensions={0}
+// CHECK-NEXT:   [[map_23:%[^ ]+]] = f32[364,128]{1,0} map([[get_tuple_element_4_8]], [[get_tuple_element_5_9]], [[broadcast_19]], [[broadcast_1_22]]), dimensions={0,1}, to_apply=[[MaxMin_7]].clone
 // CHECK-NEXT:   [[reshape_4_24:%[^ ]+]] = f32[46592]{0} reshape([[map_23]])
-// CHECK-NEXT:   [[map_1_25:%[^ ]+]] = f32[364,128]{0,1} map([[get_tuple_element_4_8]], [[get_tuple_element_5_9]], [[broadcast_19]], [[broadcast_1_22]]), dimensions={0,1}, to_apply=[[MaxMin_7]].clone.1
+// CHECK-NEXT:   [[map_1_25:%[^ ]+]] = f32[364,128]{1,0} map([[get_tuple_element_4_8]], [[get_tuple_element_5_9]], [[broadcast_19]], [[broadcast_1_22]]), dimensions={0,1}, to_apply=[[MaxMin_7]].clone.1
 // CHECK-NEXT:   [[reshape_5_26:%[^ ]+]] = f32[46592]{0} reshape([[map_1_25]])
 // CHECK-NEXT:   ROOT [[tuple_27:%[^ ]+]] = (f32[46592]{0}, f32[46592]{0}) tuple([[reshape_4_24]], [[reshape_5_26]])
 // CHECK-NEXT: }
@@ -213,15 +213,15 @@ ENTRY entry (arg: f32[46592]) -> f32[46592] {
 // CHECK-NEXT: }
 // CHECK: ENTRY %entry (arg: f32[46592]) -> f32[46592] {
 // CHECK-NEXT:   %arg = f32[46592]{0} parameter(0)
-// CHECK-NEXT:   %reshape = f32[364,128]{0,1} reshape(%arg)
+// CHECK-NEXT:   %reshape = f32[364,128]{1,0} reshape(%arg)
 // CHECK-NEXT:   %constant = f32[] constant(0)
-// CHECK-NEXT:   %reduce-window = f32[364,128]{0,1} reduce-window(%reshape, %constant), window={size=1x128 pad=0_0x127_0}, to_apply=%add_float_rw_wrapper
-// CHECK-NEXT:   %slice = f32[364,1]{0,1} slice(%reduce-window), slice={[0:364], [127:128]}
+// CHECK-NEXT:   %reduce-window = f32[364,128]{1,0} reduce-window(%reshape, %constant), window={size=1x128 pad=0_0x127_0}, to_apply=%add_float_rw_wrapper
+// CHECK-NEXT:   %slice = f32[364,1]{1,0} slice(%reduce-window), slice={[0:364], [127:128]}
 // CHECK-NEXT:   %reshape.1 = f32[364]{0} reshape(%slice)
 // CHECK-NEXT:   %reduce-window.1 = f32[365]{0} reduce-window(%reshape.1, %constant), window={size=364 pad=364_0}, to_apply=%add_float_rw_wrapper
 // CHECK-NEXT:   %slice.1 = f32[364]{0} slice(%reduce-window.1), slice={[0:364]}
-// CHECK-NEXT:   %broadcast = f32[364,128]{0,1} broadcast(%slice.1), dimensions={0}
-// CHECK-NEXT:   %map = f32[364,128]{0,1} map(%reduce-window, %broadcast), dimensions={0,1}, to_apply=%add_float_rw_wrapper
+// CHECK-NEXT:   %broadcast = f32[364,128]{1,0} broadcast(%slice.1), dimensions={0}
+// CHECK-NEXT:   %map = f32[364,128]{1,0} map(%reduce-window, %broadcast), dimensions={0,1}, to_apply=%add_float_rw_wrapper
 // CHECK-NEXT:   %reshape.2 = f32[46592]{0} reshape(%map)
 // CHECK-NEXT:   %tuple.1 = (f32[46592]{0}, f32[]) tuple(%reshape.2, %constant)
 // CHECK-NEXT:   ROOT %result = f32[46592]{0} get-tuple-element(%tuple.1), index=0
@@ -258,15 +258,15 @@ ENTRY entry (arg: f32[46592, 128]) -> f32[46592, 128] {
 // CHECK: ENTRY %entry (arg: f32[46592,128]) -> f32[46592,128] {
 // CHECK-NEXT:   [[arg:%[^ ]+]] = f32[46592,128]{1,0} parameter(0)
 // CHECK-NEXT:   [[transpose:%[^ ]+]] = f32[128,46592]{0,1} transpose([[arg]]), dimensions={1,0}
-// CHECK-NEXT:   [[reshape:%[^ ]+]] = f32[128,364,128]{0,1,2} reshape([[transpose]])
+// CHECK-NEXT:   [[reshape:%[^ ]+]] = f32[128,364,128]{0,2,1} reshape([[transpose]])
 // CHECK-NEXT:   [[constant:%[^ ]+]] = f32[] constant(0)
-// CHECK-NEXT:   [[reduce_window:%[^ ]+]] = f32[128,364,128]{0,1,2} reduce-window([[reshape]], [[constant]]), window={size=1x1x128 pad=0_0x0_0x127_0}, to_apply=%add_float_scalarized_rw_wrapper
-// CHECK-NEXT:   [[slice:%[^ ]+]] = f32[128,364,1]{0,1,2} slice([[reduce_window]]), slice={[0:128], [0:364], [127:128]}
+// CHECK-NEXT:   [[reduce_window:%[^ ]+]] = f32[128,364,128]{0,2,1} reduce-window([[reshape]], [[constant]]), window={size=1x1x128 pad=0_0x0_0x127_0}, to_apply=%add_float_scalarized_rw_wrapper
+// CHECK-NEXT:   [[slice:%[^ ]+]] = f32[128,364,1]{0,2,1} slice([[reduce_window]]), slice={[0:128], [0:364], [127:128]}
 // CHECK-NEXT:   [[reshape_1:%[^ ]+]] = f32[128,364]{0,1} reshape([[slice]])
 // CHECK-NEXT:   [[reduce_window_1:%[^ ]+]] = f32[128,365]{0,1} reduce-window([[reshape_1]], [[constant]]), window={size=1x364 pad=0_0x364_0}, to_apply=%add_float_scalarized_rw_wrapper
 // CHECK-NEXT:   [[slice_1:%[^ ]+]] = f32[128,364]{0,1} slice([[reduce_window_1]]), slice={[0:128], [0:364]}
-// CHECK-NEXT:   [[broadcast:%[^ ]+]] = f32[128,364,128]{0,1,2} broadcast([[slice_1]]), dimensions={0,1}
-// CHECK-NEXT:   [[map:%[^ ]+]] = f32[128,364,128]{0,1,2} map([[reduce_window]], [[broadcast]]), dimensions={0,1,2}, to_apply=%add_float_scalarized_rw_wrapper
+// CHECK-NEXT:   [[broadcast:%[^ ]+]] = f32[128,364,128]{0,2,1} broadcast([[slice_1]]), dimensions={0,1}
+// CHECK-NEXT:   [[map:%[^ ]+]] = f32[128,364,128]{0,2,1} map([[reduce_window]], [[broadcast]]), dimensions={0,1,2}, to_apply=%add_float_scalarized_rw_wrapper
 // CHECK-NEXT:   [[reshape_2:%[^ ]+]] = f32[128,46592]{0,1} reshape([[map]])
 // CHECK-NEXT:   [[transpose_1:%[^ ]+]] = f32[46592,128]{1,0} transpose([[reshape_2]]), dimensions={1,0}
 // CHECK-NEXT:   [[init:%[^ ]+]] = f32[128]{0} broadcast([[constant]]), dimensions={}
@@ -580,6 +580,155 @@ ENTRY entry (arg: f32[128]) -> f32[128] {
 // CHECK-NEXT:   ROOT [[result:%[^ ]+]] = f32[128]{0} get-tuple-element([[tuple_1]]), index=0
 // CHECK-NEXT: }
   )");
+}
+
+TEST_F(ReduceWindowRewriterTest, BaseLengthOneDoesNotRewrite) {
+  const char* hlo = R"(
+HloModule scan
+
+add_float {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+ENTRY entry (arg: f32[128]) -> f32[128] {
+  arg = f32[128]{0} parameter(0)
+  constant = f32[] constant(0)
+  ROOT reduce-window = f32[128]{0} reduce-window(f32[128]{0} %arg, f32[] %constant), window={size=128 pad=127_0}, to_apply=%add_float
+})";
+
+  RunAndFilecheckHloRewrite(hlo, ReduceWindowRewriter{1}, std::nullopt);
+}
+
+TEST_F(ReduceWindowRewriterTest, AssociativeScanBaseLengthOneDoesNotRewrite) {
+  const char* hlo = R"(
+HloModule scan
+
+add_float {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  add = f32[] add(lhs, rhs)
+  ROOT tuple = (f32[], f32[]) tuple(add, add)
+}
+
+ENTRY entry (arg: f32[128]) -> f32[128] {
+  arg = f32[128]{0} parameter(0)
+  constant = f32[] constant(0)
+  scan = (f32[128]{0}, f32[]) scan(f32[128]{0} %arg, f32[] %constant), dimensions={0}, num_carries=1, to_apply=%add_float, is_associative=true
+  ROOT result = f32[128]{0} get-tuple-element(scan), index=0
+})";
+
+  RunAndFilecheckHloRewrite(hlo, AssociativeScanRewriter{1}, std::nullopt);
+}
+
+TEST_F(ReduceWindowRewriterTest, NoOptimizeScanOnDynamicDimension) {
+  // Regression test for https://github.com/openxla/xla/issues/44944: scans
+  // over a dynamic dimension must not be tiled.
+  const char* hlo = R"(
+HloModule reduce-window
+
+mul_s64 {
+  lhs = s64[] parameter(0)
+  rhs = s64[] parameter(1)
+  ROOT mul = s64[] multiply(lhs, rhs)
+}
+
+ENTRY entry (arg: s64[3,<=256]) -> s64[3,<=256] {
+  arg = s64[3,<=256]{1,0} parameter(0)
+  constant = s64[] constant(1)
+  ROOT reduce-window = s64[3,<=256]{1,0} reduce-window(s64[3,<=256]{1,0} %arg, s64[] %constant), window={size=1x256 pad=0_0x255_0}, to_apply=%mul_s64
+})";
+
+  CheckReduceWindowRewrite(hlo, std::nullopt);
+}
+
+TEST_F(ReduceWindowRewriterTest, DynamicAssociativeScanUsesSingleReduceWindow) {
+  // A scan instruction over a dynamic dimension must use the single
+  // reduce-window lowering, never the tree rewrite.
+  const char* hlo = R"(
+HloModule scan
+
+add_s32 {
+  lhs = s32[] parameter(0)
+  rhs = s32[] parameter(1)
+  add = s32[] add(lhs, rhs)
+  ROOT tuple = (s32[], s32[]) tuple(add, add)
+}
+
+ENTRY entry (arg: s32[<=256]) -> s32[<=256] {
+  arg = s32[<=256]{0} parameter(0)
+  constant = s32[] constant(0)
+  scan = (s32[<=256]{0}, s32[]) scan(s32[<=256]{0} %arg, s32[] %constant), dimensions={0}, num_carries=1, to_apply=%add_s32, is_associative=true
+  ROOT result = s32[<=256]{0} get-tuple-element(scan), index=0
+})";
+
+  CheckScanRewrite(hlo, R"(
+// CHECK-NOT: map(
+// CHECK: reduce-window({{.*}}), window={size=256 pad=255_0}
+// CHECK-NOT: map(
+)");
+}
+
+TEST_F(ReduceWindowRewriterTest, DynamicScanR1NotTiled) {
+  // R1 scans on a dynamic dimension may get the unit-dimension wrap but must
+  // not be tiled.
+  const char* hlo = R"(
+HloModule reduce-window
+
+mul_s64 {
+  lhs = s64[] parameter(0)
+  rhs = s64[] parameter(1)
+  ROOT mul = s64[] multiply(lhs, rhs)
+}
+
+ENTRY entry (arg: s64[<=256]) -> s64[<=256] {
+  arg = s64[<=256]{0} parameter(0)
+  constant = s64[] constant(1)
+  ROOT reduce-window = s64[<=256]{0} reduce-window(s64[<=256]{0} %arg, s64[] %constant), window={size=256 pad=255_0}, to_apply=%mul_s64
+})";
+
+  CheckReduceWindowRewrite(hlo, R"(
+// CHECK-NOT: map(
+// CHECK: reduce-window({{.*}}), window={size=256x1 pad=255_0x0_0}
+// CHECK-NOT: map(
+)");
+}
+
+TEST_F(ReduceWindowRewriterTest, MultipleScansAreSupported) {
+  CheckScanRewrite(R"(
+add_s32 {
+  lhs = s32[] parameter(0)
+  rhs = s32[] parameter(1)
+  add = s32[] add(lhs, rhs)
+  t = (s32[], s32[]) tuple(add, add)
+}
+
+scan_a {
+  arg = s32[256] parameter(0)
+  zero = s32[] constant(0)
+  scan = (s32[256], s32[]) scan(arg, zero), dimensions={0},
+    num_carries=1, to_apply=add_s32, is_associative=true
+  r = s32[256] get-tuple-element(scan), index=0
+}
+
+scan_b {
+  arg = s32[256] parameter(0)
+  zero = s32[] constant(0)
+  scan = (s32[256], s32[]) scan(arg, zero), dimensions={0},
+    num_carries=1, to_apply=add_s32, is_associative=true
+  r = s32[256] get-tuple-element(scan), index=0
+}
+
+entry {
+  arg = s32[256] parameter(0)
+  a = s32[256] call(arg), to_apply=scan_a
+  b = s32[256] call(arg), to_apply=scan_b
+  r = (s32[256], s32[256]) tuple(a, b)
+})",
+                   R"(
+// CHECK-NOT: scan(
+)");
 }
 
 }  // namespace

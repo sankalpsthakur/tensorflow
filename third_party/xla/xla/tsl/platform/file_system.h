@@ -27,10 +27,10 @@ limitations under the License.
 
 #include "absl/base/macros.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/file_statistics.h"
 #include "tsl/platform/cord.h"
@@ -137,6 +137,9 @@ class FileSystem {
   /// \brief Given a pattern, stores in *results the set of paths that matches
   /// that pattern. *results is cleared.
   ///
+  /// Implementations should return the paths sorted in ascending lexicographic
+  /// order. Env::GetMatchingPaths sorts them regardless of the implementation.
+  ///
   /// pattern must match all of a name, not just a substring.
   ///
   /// pattern: { term }
@@ -158,6 +161,12 @@ class FileSystem {
   ///                    implemented
   virtual absl::Status GetMatchingPaths(const std::string& pattern,
                                         std::vector<std::string>* results) = 0;
+
+  virtual absl::Status GetMatchingPaths(const std::string& pattern,
+                                        std::vector<std::string>* results,
+                                        bool multithreaded) {
+    return GetMatchingPaths(pattern, results);
+  }
 
   /// \brief Checks if the given filename matches the pattern.
   ///

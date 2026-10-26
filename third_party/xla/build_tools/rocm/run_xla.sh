@@ -22,12 +22,13 @@ set -e
 set -x
 
 N_BUILD_JOBS=$(grep -c ^processor /proc/cpuinfo)
-# If rocm-smi exists locally (it should) use it to find
+# amd-smi replaces the deprecated rocm-smi CLI as of ROCm 7.14.
+# If amd-smi exists locally (it should) use it to find
 # out how many GPUs we have to test with.
-rocm-smi -i
+amd-smi list
 STATUS=$?
 if [ $STATUS -ne 0 ]; then TF_GPU_COUNT=1; else
-   TF_GPU_COUNT=$(rocm-smi -i|grep 'Device ID' |grep 'GPU' |wc -l)
+   TF_GPU_COUNT=$(amd-smi list|grep -c '^GPU:')
 fi
 TF_TESTS_PER_GPU=1
 N_TEST_JOBS=$(expr ${TF_GPU_COUNT} \* ${TF_TESTS_PER_GPU})
@@ -46,7 +47,6 @@ $SCRIPT_DIR/run_xla_ci_build.sh \
     --config=ci_single_gpu \
     --local_test_jobs=${N_TEST_JOBS} \
     --test_env=TF_TESTS_PER_GPU=$TF_TESTS_PER_GPU \
-    --keep_going \
     --test_env=TF_GPU_COUNT=$TF_GPU_COUNT \
     --action_env=TF_ROCM_AMDGPU_TARGETS=${AMD_GPU_GFX_ID} \
     --repo_env="ROCM_PATH=$ROCM_PATH" \

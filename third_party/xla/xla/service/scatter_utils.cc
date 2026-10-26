@@ -21,10 +21,10 @@ limitations under the License.
 
 #include "absl/algorithm/container.h"
 #include "absl/log/check.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 
@@ -148,7 +149,8 @@ absl::StatusOr<HloComputation*> CallAndGetOutput(HloComputation* original,
       HloInstruction::CreateCall(original_root->shape(),
                                  new_comp->parameter_instructions(), original));
   call_original->set_original_value(
-      std::make_shared<OriginalValue>(OriginalValue::SyntheticCall()));
+      std::make_shared<OriginalValue>(call_original->shape(),
+                                      /*call_hierarchy=*/""));
   new_comp->set_root_instruction(
       new_comp->AddInstruction(
           HloInstruction::CreateGetTupleElement(call_original, output_index)),
@@ -192,7 +194,8 @@ absl::StatusOr<HloComputation*> CallComputationAndGetIthOutputWithBinaryParams(
   HloInstruction* call_original = new_comp->AddInstruction(
       HloInstruction::CreateCall(original_root->shape(), operands, original));
   call_original->set_original_value(
-      std::make_shared<OriginalValue>(OriginalValue::SyntheticCall()));
+      std::make_shared<OriginalValue>(call_original->shape(),
+                                      /*call_hierarchy=*/""));
   new_comp->set_root_instruction(
       new_comp->AddInstruction(
           HloInstruction::CreateGetTupleElement(call_original, output_index)),

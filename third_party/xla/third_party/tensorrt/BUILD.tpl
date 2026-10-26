@@ -20,6 +20,8 @@ licenses(["notice"])
 
 load("@local_config_cuda//cuda:build_defs.bzl", "cuda_default_copts")
 load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_python//python:defs.bzl", "py_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -51,6 +53,8 @@ cc_library(
         ":use_static_tensorrt": [],
         "//conditions:default": [":tensorrt_lib"],
     }),
+    # -supports_dynamic_linker: Forces static linking even with --dynamic_mode=fully
+    features = ["-supports_dynamic_linker"],
     linkstatic = 1,
     deps = [
         ":tensorrt_headers",

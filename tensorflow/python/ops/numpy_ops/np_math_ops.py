@@ -56,6 +56,15 @@ tf_export.tf_export('experimental.numpy.inf', v1=[]).export_constant(
     __name__, 'inf'
 )
 
+# Floating-point types mapped to an integer type of the same size, so their
+# IEEE-754 sign bit can be checked with an integer comparison.
+_SIGN_BITCAST_DTYPES = {
+    dtypes.bfloat16: dtypes.int16,
+    dtypes.float16: dtypes.int16,
+    dtypes.float32: dtypes.int32,
+    dtypes.float64: dtypes.int64,
+}
+
 
 @tf_export.tf_export('experimental.numpy.dot', v1=[])
 @np_utils.np_doc_only('dot')
@@ -223,7 +232,8 @@ def minimum(x1, x2):
 @np_utils.np_doc('clip')
 def clip(a, a_min, a_max):  # pylint: disable=missing-docstring
   if a_min is None and a_max is None:
-    raise ValueError('Not more than one of `a_min` and `a_max` may be `None`.')
+    # NumPy (>= 2.0) returns the input unchanged when both bounds are None.
+    return np_array_ops.asarray(a)
   if a_min is None:
     return minimum(a, a_max)
   elif a_max is None:
@@ -326,8 +336,19 @@ def cross(a, b, axisa=-1, axisb=-1, axisc=-1, axis=None):  # pylint: disable=mis
 
     a = maybe_move_axis_to_last(a, axis_a)
     b = maybe_move_axis_to_last(b, axis_b)
-    a_dim = np_utils.getitem(array_ops.shape(a), -1)
-    b_dim = np_utils.getitem(array_ops.shape(b), -1)
+
+    def size_of_last_dim(a):
+      # Prefer the statically-known dimension so that the padding and output
+      # selection below resolve at trace time; a dynamic size turns them into
+      # tf.cond branches whose output shapes XLA cannot infer.
+      if hasattr(a, 'shape') and a.shape.rank:
+        static_size = a.shape.as_list()[-1]
+        if static_size is not None:
+          return static_size
+      return np_utils.getitem(array_ops.shape(a), -1)
+
+    a_dim = size_of_last_dim(a)
+    b_dim = size_of_last_dim(b)
 
     def maybe_pad_0(a, size_of_last_dim):
       def pad_0(a):
@@ -382,7 +403,7 @@ def vdot(a, b):  # pylint: disable=missing-docstring
   a, b = np_array_ops._promote_dtype(a, b)  # pylint: disable=protected-access
   a = np_array_ops.reshape(a, [-1])
   b = np_array_ops.reshape(b, [-1])
-  if a.dtype == np_dtypes.complex128 or a.dtype == np_dtypes.complex64:
+  if a.dtype.is_complex:
     a = conj(a)
   return dot(a, b)
 
@@ -395,8 +416,16 @@ def power(x1, x2):
 
 @tf_export.tf_export('experimental.numpy.float_power', v1=[])
 @np_utils.np_doc('float_power')
-def float_power(x1, x2):
-  return power(x1, x2)
+def float_power(x1, x2):  # pylint: disable=missing-function-docstring
+  # Unlike `power`, NumPy always computes `float_power` in the widest float
+  # (or complex) type, which is what lets integers be raised to negative
+  # powers.
+  x1, x2 = np_array_ops._promote_dtype_binary(x1, x2)  # pylint: disable=protected-access
+  if x1.dtype.is_complex:
+    dtype = np_utils.result_type(complex)
+  else:
+    dtype = np_utils.result_type(float)
+  return power(math_ops.cast(x1, dtype), math_ops.cast(x2, dtype))
 
 
 @tf_export.tf_export('experimental.numpy.arctan2', v1=[])
@@ -415,22 +444,63 @@ def nextafter(x1, x2):
 @np_utils.np_doc('heaviside')
 def heaviside(x1, x2):  # pylint: disable=missing-function-docstring
   def f(x1, x2):
+    dtype = x2.dtype
+    zero = constant_op.constant(0, dtype=dtype)
+    one = constant_op.constant(1, dtype=dtype)
+    # NumPy propagates NaN from the first argument. TensorFlow's relational
+    # operators evaluate to False for NaN inputs, so the `x1 > 0` and
+    # `x1 < 0` branches both miss and the value falls through to `x2`. Nest
+    # the NaN selection into that fallback so the outer `where_v2` remains a
+    # single pass over the tensor. Integer dtypes cannot represent NaN, so
+    # only floating inputs get the extra mask. Use the native `is_floating`
+    # property rather than `np.issubdtype(..., np.inexact)`: TensorFlow's
+    # bfloat16 maps to `ml_dtypes.bfloat16`, which is not part of NumPy's
+    # `inexact` hierarchy.
+    fallback = x2
+    if x1.dtype.is_floating:
+      nan = constant_op.constant(np.nan, dtype=dtype)
+      fallback = array_ops.where_v2(math_ops.is_nan(x1), nan, fallback)
     return array_ops.where_v2(
-        x1 < 0,
-        constant_op.constant(0, dtype=x2.dtype),
-        array_ops.where_v2(x1 > 0, constant_op.constant(1, dtype=x2.dtype), x2),
+        x1 > 0, one, array_ops.where_v2(x1 < 0, zero, fallback)
     )
 
   y = _bin_op(f, x1, x2)
-  if not np.issubdtype(y.dtype.as_numpy_dtype, np.inexact):
-    y = y.astype(np_utils.result_type(float))
+  if not y.dtype.is_floating:
+    # See the note in `_scalar`: `astype` is unavailable without the
+    # `enable_numpy_methods_on_tensor()` opt-in.
+    y = math_ops.cast(y, np_utils.result_type(float))
   return y
 
 
 @tf_export.tf_export('experimental.numpy.hypot', v1=[])
 @np_utils.np_doc('hypot')
-def hypot(x1, x2):
-  return sqrt(square(x1) + square(x2))
+def hypot(x1, x2):  # pylint: disable=missing-function-docstring
+  def f(x1, x2):
+    # Promote non-floating inputs so scaling and sqrt stay accurate (matches
+    # the previous sqrt(square(x)+square(y)) float promotion via sqrt).
+    if not np.issubdtype(x1.dtype.as_numpy_dtype, np.inexact):
+      dtype = np_utils.result_type(float)
+      x1 = math_ops.cast(x1, dtype)
+      x2 = math_ops.cast(x2, dtype)
+    x1 = math_ops.abs(x1)
+    x2 = math_ops.abs(x2)
+    # C99/IEEE: hypot(±inf, y) == +inf even when y is NaN.
+    either_inf = math_ops.logical_or(math_ops.is_inf(x1), math_ops.is_inf(x2))
+    max_abs = math_ops.maximum(x1, x2)
+    min_abs = math_ops.minimum(x1, x2)
+    zero = constant_op.constant(0, dtype=max_abs.dtype)
+    one = constant_op.constant(1, dtype=max_abs.dtype)
+    # Scale by the larger magnitude to avoid intermediate overflow/underflow
+    # from square(x) + square(y) (e.g. hypot(1e200, 1e200) must stay finite).
+    safe_max = array_ops.where_v2(math_ops.equal(max_abs, zero), one, max_abs)
+    result = max_abs * math_ops.sqrt(one + math_ops.square(min_abs / safe_max))
+    return array_ops.where_v2(
+        either_inf,
+        constant_op.constant(np.inf, dtype=result.dtype),
+        result,
+    )
+
+  return _bin_op(f, x1, x2)
 
 
 @tf_export.tf_export('experimental.numpy.kron', v1=[])
@@ -482,25 +552,49 @@ def outer(a, b):
 @tf_export.tf_export('experimental.numpy.logaddexp', v1=[])
 @np_utils.np_doc('logaddexp')
 def logaddexp(x1, x2):
-  amax = maximum(x1, x2)
-  delta = x1 - x2
-  return np_array_ops.where(
-      isnan(delta),
-      x1 + x2,  # NaNs or infinities of the same sign.
-      amax + log1p(exp(-abs(delta))),
-  )
+
+  def f(x1, x2):
+    if not np.issubdtype(x1.dtype.as_numpy_dtype, np.inexact):
+      float_dtype = np_utils.result_type(float)
+      x1 = math_ops.cast(x1, float_dtype)
+      x2 = math_ops.cast(x2, float_dtype)
+    delta = x1 - x2
+    # `maximum` sends the whole gradient to `x1` where `x1 == x2`, so the two
+    # partial derivatives (analytically 0.5 each) come out as 1.0 and 0.0.
+    # Selecting the operands through `where` instead keeps the forward values
+    # bit-for-bit identical while giving each argument its own differentiable
+    # expression, so both gradients are 0.5 at `x1 == x2`. Selecting them once
+    # also avoids evaluating `exp` and `log1p` for both branches. The exponent
+    # is always <= 0, hence this cannot overflow.
+    max_val = np_array_ops.where(x1 > x2, x1, x2)
+    min_val = np_array_ops.where(x1 > x2, x2, x1)
+    return np_array_ops.where(
+        isnan(delta),
+        x1 + x2,  # NaNs or infinities of the same sign.
+        max_val + log1p(exp(min_val - max_val)),
+    )
+
+  return _bin_op(f, x1, x2)
 
 
 @tf_export.tf_export('experimental.numpy.logaddexp2', v1=[])
 @np_utils.np_doc('logaddexp2')
 def logaddexp2(x1, x2):
-  amax = maximum(x1, x2)
-  delta = x1 - x2
-  return np_array_ops.where(
-      isnan(delta),
-      x1 + x2,  # NaNs or infinities of the same sign.
-      amax + log1p(exp2(-abs(delta))) / np.log(2),
-  )
+
+  def f(x1, x2):
+    if not np.issubdtype(x1.dtype.as_numpy_dtype, np.inexact):
+      float_dtype = np_utils.result_type(float)
+      x1 = math_ops.cast(x1, float_dtype)
+      x2 = math_ops.cast(x2, float_dtype)
+    amax = maximum(x1, x2)
+    delta = x1 - x2
+    return np_array_ops.where(
+        isnan(delta),
+        x1 + x2,  # NaNs or infinities of the same sign.
+        amax + log1p(exp2(-abs(delta))) / math_ops.cast(np.log(2), x1.dtype),
+    )
+
+  return _bin_op(f, x1, x2)
 
 
 @tf_export.tf_export('experimental.numpy.polyval', v1=[])
@@ -529,9 +623,37 @@ def isclose(a, b, rtol=1e-05, atol=1e-08, equal_nan=False):  # pylint: disable=m
     if np.issubdtype(dtype.as_numpy_dtype, np.inexact):
       rtol_ = ops.convert_to_tensor(rtol, dtype.real_dtype)
       atol_ = ops.convert_to_tensor(atol, dtype.real_dtype)
-      result = math_ops.abs(a - b) <= atol_ + rtol_ * math_ops.abs(b)
+
+      b_abs = math_ops.abs(b)
+      result = math_ops.abs(a - b) <= atol_ + rtol_ * b_abs
+
+      # Infinities must be handled separately. The finite tolerance formula
+      # evaluates to True for mixed finite/infinite pairs like (1.0, inf)
+      # because inf <= inf. Match NumPy: elements are close if they are
+      # both finite and within tolerance, or if they are equal.
+      if dtype.is_floating or dtype.is_complex:
+        if dtype.is_complex:
+          both_finite = (
+              math_ops.is_finite(math_ops.real(a))
+              & math_ops.is_finite(math_ops.imag(a))
+              & math_ops.is_finite(math_ops.real(b))
+              & math_ops.is_finite(math_ops.imag(b))
+          )
+        else:
+          both_finite = math_ops.is_finite(a) & math_ops.is_finite(b)
+        result = (both_finite & result) | math_ops.equal(a, b)
+
       if equal_nan:
-        result = result | (math_ops.is_nan(a) & math_ops.is_nan(b))
+        if dtype.is_complex:
+          a_nan = math_ops.is_nan(math_ops.real(a)) | math_ops.is_nan(
+              math_ops.imag(a)
+          )
+          b_nan = math_ops.is_nan(math_ops.real(b)) | math_ops.is_nan(
+              math_ops.imag(b)
+          )
+          result = result | (a_nan & b_nan)
+        else:
+          result = result | (math_ops.is_nan(a) & math_ops.is_nan(b))
       return result
     elif np.issubdtype(dtype.as_numpy_dtype, np.integer):
       # Use the operands' own arithmetic instead of casting to float, so
@@ -708,7 +830,10 @@ def _scalar(tf_fn, x, promote_to_float=False):
   """
   x = np_array_ops.asarray(x)
   if promote_to_float and not np.issubdtype(x.dtype.as_numpy_dtype, np.inexact):
-    x = x.astype(np_utils.result_type(float))
+    # `Tensor.astype` only exists once `enable_numpy_methods_on_tensor()` has
+    # been called, and is an alias of `math_ops.cast`; calling `cast` directly
+    # keeps these functions working without that opt-in.
+    x = math_ops.cast(x, np_utils.result_type(float))
   return tf_fn(x)
 
 
@@ -745,7 +870,9 @@ def absolute(x):
 @tf_export.tf_export('experimental.numpy.fabs', v1=[])
 @np_utils.np_doc('fabs')
 def fabs(x):
-  return abs(x)
+  # Unlike `absolute`, `fabs` always produces a floating point result,
+  # so an integer argument has to be promoted first.
+  return _scalar(math_ops.abs, x, True)
 
 
 @tf_export.tf_export('experimental.numpy.ceil', v1=[])
@@ -778,15 +905,21 @@ def reciprocal(x):
   return _scalar(math_ops.reciprocal, x)
 
 
+def _signbit(x):
+  if x.dtype == dtypes.bool:
+    return array_ops.fill(array_ops.shape(x), False)
+  if x.dtype in _SIGN_BITCAST_DTYPES:
+    # Check the IEEE-754 sign bit instead of comparing with zero, which
+    # cannot tell -0.0 from +0.0 or a negative NaN from a positive one.
+    bits = array_ops.bitcast(x, _SIGN_BITCAST_DTYPES[x.dtype])
+    return bits < 0
+  return x < 0
+
+
 @tf_export.tf_export('experimental.numpy.signbit', v1=[])
 @np_utils.np_doc('signbit')
 def signbit(x):
-  def f(x):
-    if x.dtype == dtypes.bool:
-      return array_ops.fill(array_ops.shape(x), False)
-    return x < 0
-
-  return _scalar(f, x)
+  return _scalar(_signbit, x)
 
 
 @tf_export.tf_export('experimental.numpy.sin', v1=[])
@@ -873,7 +1006,11 @@ def deg2rad(x):
 @tf_export.tf_export('experimental.numpy.rad2deg', v1=[])
 @np_utils.np_doc('rad2deg')
 def rad2deg(x):
-  return x * (180.0 / np.pi)
+
+  def f(x):
+    return x * (180.0 / np.pi)
+
+  return _scalar(f, x, True)
 
 
 _tf_float_types = [
@@ -890,7 +1027,14 @@ def angle(z, deg=False):  # pylint: disable=missing-function-docstring
   def f(x):
     if x.dtype in _tf_float_types:
       # Workaround for b/147515503
-      return array_ops.where_v2(x < 0, np.pi, 0)
+      # `np.pi` and `0` are Python scalars, which would make the result
+      # float32 whatever `x` is, so build them in `x`'s dtype instead.
+      pi_or_zero = array_ops.where_v2(
+          _signbit(x),
+          constant_op.constant(np.pi, dtype=x.dtype),
+          constant_op.constant(0, dtype=x.dtype),
+      )
+      return array_ops.where_v2(math_ops.is_nan(x), x, pi_or_zero)
     else:
       return math_ops.angle(x)
 
@@ -906,7 +1050,7 @@ def cbrt(x):
   def f(x):
     # __pow__ can't handle negative base, so we use `abs` here.
     rt = math_ops.abs(x) ** (1.0 / 3)
-    return array_ops.where_v2(x < 0, -rt, rt)
+    return array_ops.where_v2(_signbit(x), -rt, rt)
 
   return _scalar(f, x, True)
 
@@ -1023,25 +1167,48 @@ def isfinite(x):
 @tf_export.tf_export('experimental.numpy.isinf', v1=[])
 @np_utils.np_doc('isinf')
 def isinf(x):
+  x = np_array_ops.asarray(x)
   if x.dtype.is_floating:
     return _scalar(math_ops.is_inf, x, True)
-  return False
+  if x.dtype.is_complex:
+    # Match NumPy: a complex value is infinite if either its real or its
+    # imaginary part is infinite. The IsInf kernel has no complex variant,
+    # so check the two parts separately.
+    return math_ops.logical_or(
+        _scalar(math_ops.is_inf, math_ops.real(x), True),
+        _scalar(math_ops.is_inf, math_ops.imag(x), True),
+    )
+  return np_array_ops.zeros_like(x, dtypes.bool)
 
 
 @tf_export.tf_export('experimental.numpy.isneginf', v1=[])
 @np_utils.np_doc('isneginf')
 def isneginf(x):
+  x = np_array_ops.asarray(x)
   if x.dtype.is_floating:
     return x == np_array_ops.full_like(x, -np.inf)
-  return False
+  if x.dtype.is_complex:
+    # Match NumPy, which rejects complex inputs as ambiguous.
+    raise TypeError(
+        f'This operation is not supported for {x.dtype.name} values '
+        'because it would be ambiguous.'
+    )
+  return np_array_ops.zeros_like(x, dtypes.bool)
 
 
 @tf_export.tf_export('experimental.numpy.isposinf', v1=[])
 @np_utils.np_doc('isposinf')
 def isposinf(x):
+  x = np_array_ops.asarray(x)
   if x.dtype.is_floating:
     return x == np_array_ops.full_like(x, np.inf)
-  return False
+  if x.dtype.is_complex:
+    # Match NumPy, which rejects complex inputs as ambiguous.
+    raise TypeError(
+        f'This operation is not supported for {x.dtype.name} values '
+        'because it would be ambiguous.'
+    )
+  return np_array_ops.zeros_like(x, dtypes.bool)
 
 
 @tf_export.tf_export('experimental.numpy.log2', v1=[])
@@ -1073,8 +1240,15 @@ def positive(x):
 def sinc(x):
   def f(x):
     pi_x = x * np.pi
+    is_zero = x == 0
+    # `sin(pi_x) / pi_x` is 0/0 at `x == 0`. That branch is never selected, but
+    # `where` still propagates its gradient, and 0 * nan is nan, so the
+    # gradient at zero comes out as nan instead of 0. Substituting 1 for the
+    # denominator keeps the selected value bit-for-bit identical while making
+    # the discarded branch finite, so its contribution is scaled to exactly 0.
+    safe_pi_x = array_ops.where_v2(is_zero, array_ops.ones_like(pi_x), pi_x)
     return array_ops.where_v2(
-        x == 0, array_ops.ones_like(x), math_ops.sin(pi_x) / pi_x
+        is_zero, array_ops.ones_like(x), math_ops.sin(safe_pi_x) / safe_pi_x
     )
 
   return _scalar(f, x, True)
@@ -1098,14 +1272,15 @@ def diff(a, n=1, axis=-1):  # pylint: disable=missing-function-docstring
           'Function `diff` currently requires a known rank for input `a`. '
           f'Received: a={a} (unknown rank)'
       )
-    if (axis + nd if axis < 0 else axis) >= nd:
+    axis_normalized = axis + nd if axis < 0 else axis
+    if axis_normalized < 0 or axis_normalized >= nd:
       raise ValueError(
           f'Argument `axis` (received axis={axis}) is out of bounds '
           f'for input {a} of rank {nd}.'
       )
     if n < 0:
       raise ValueError(
-          f'Argument `order` must be a non-negative integer. Received: axis={n}'
+          f'Argument `n` must be a non-negative integer. Received: n={n}'
       )
     slice1 = [slice(None)] * nd
     slice2 = [slice(None)] * nd
@@ -1237,26 +1412,65 @@ def logical_not(x):
   return math_ops.logical_not(x)
 
 
+def _validate_destination_axis(axis, start, stop):
+  """Validates the destination axis for linspace and geomspace."""
+  # NumPy raises AxisError for an out-of-bounds destination axis instead of
+  # letting the backend fail with a confusing error. In NumPy the samples
+  # array has rank `bd + 1`, where `bd` is the broadcast rank of `start` and
+  # `stop`, and valid destination axes are [-(bd + 1), bd] - exactly the
+  # domain the backend's `expand_dims`/`moveaxis` accepts. Only
+  # statically-known ranks and Python-int `axis` values are checked; unknown
+  # ranks or tensor axes, e.g. `@tf.function` with an unspecified input
+  # signature, behave exactly as before, and no graph ops are added on the
+  # eager path.
+  if isinstance(axis, (int, np.integer)):
+    maybe_bd = start.shape.rank
+    maybe_bd_stop = stop.shape.rank
+    if maybe_bd is not None and maybe_bd_stop is not None:
+      dimension = max(maybe_bd, maybe_bd_stop) + 1
+      normalized = int(axis)
+      if normalized < 0:
+        normalized += dimension
+      if normalized < 0 or normalized >= dimension:
+        raise ValueError(
+            f'destination: axis {axis} is out of bounds for array of '
+            f'dimension {dimension}'
+        )
+
+
 @tf_export.tf_export('experimental.numpy.linspace', v1=[])
 @np_utils.np_doc('linspace')
 def linspace(  # pylint: disable=missing-docstring
     start, stop, num=50, endpoint=True, retstep=False, dtype=float, axis=0
 ):
-  if dtype:
-    # In numpy 2.x, the result type of np.linspace is based off of `start` and
-    # `end`. We mimic the behavior.
-    if np.lib.NumpyVersion(np.__version__) >= '2.0.0.dev0':
-      dtype = np_utils.result_type([start * 1.0, stop * 1.0])
-    else:
-      dtype = np_utils.result_type(dtype)
-  start = np_array_ops.array(start, dtype=dtype)
-  stop = np_array_ops.array(stop, dtype=dtype)
+  # numpy computes the samples in a floating point type derived from `start`
+  # and `stop`, and only casts them to `dtype` as a final step. `dtype` must
+  # therefore not be used as the computation type, otherwise e.g. an integer
+  # `dtype` would truncate the samples before they are even computed.
+  # The default value of `dtype` plays the role of numpy's `dtype=None`, i.e.
+  # "infer the output type", so it is not treated as an explicit request.
+  if dtype is float or dtype is None:
+    dtype = None
+  else:
+    dtype = np_utils.result_type(dtype)
+  # In numpy 2.x, the result type of np.linspace is based off of `start` and
+  # `end`. We mimic the behavior.
+  if np.lib.NumpyVersion(np.__version__) >= '2.0.0.dev0':
+    computation_dtype = np_utils.result_type(start, stop)
+    if not (computation_dtype.is_floating or computation_dtype.is_complex):
+      computation_dtype = np_utils.result_type(float)
+  else:
+    computation_dtype = np_utils.result_type(float)
+  start = np_array_ops.array(start, dtype=computation_dtype)
+  stop = np_array_ops.array(stop, dtype=computation_dtype)
   if num < 0:
     raise ValueError(
         'Argument `num` (number of samples) must be a non-negative integer. '
         f'Received: num={num}'
     )
   step = ops.convert_to_tensor(np.nan)
+  _validate_destination_axis(axis, start, stop)
+
   if endpoint:
     result = math_ops.linspace(start, stop, num, axis=axis)
     if num > 1:
@@ -1272,7 +1486,7 @@ def linspace(  # pylint: disable=missing-docstring
       result = math_ops.linspace(start, new_stop, num, axis=axis)
     else:
       result = math_ops.linspace(start, stop, num, axis=axis)
-  if dtype:
+  if dtype is not None:
     if dtype.is_integer:
       # Since numpy 1.20, linspace's rounding is towards -inf instead of 0
       result = math_ops.floor(result)
@@ -1286,19 +1500,44 @@ def linspace(  # pylint: disable=missing-docstring
 @tf_export.tf_export('experimental.numpy.logspace', v1=[])
 @np_utils.np_doc('logspace')
 def logspace(start, stop, num=50, endpoint=True, base=10.0, dtype=None, axis=0):
-  # In numpy 2.x, the result type of np.logspace is based off of `start` and
-  # `end`. We mimic the behavior.
-  if np.lib.NumpyVersion(np.__version__) >= '2.0.0.dev0':
-    dtype = np_utils.result_type([start * 1.0, stop * 1.0])
-  else:
-    dtype = np_utils.result_type(start, stop, dtype)
-  result = linspace(
-      start, stop, num=num, endpoint=endpoint, dtype=dtype, axis=axis
-  )
+  # Like numpy, the exponents are computed in the floating point type derived
+  # from `start` and `stop` (which `linspace` takes care of), and `dtype` only
+  # determines the type the final result is cast to.
+  result = linspace(start, stop, num=num, endpoint=endpoint, axis=axis)
   result = math_ops.pow(math_ops.cast(base, result.dtype), result)
-  if dtype:
-    result = math_ops.cast(result, dtype)
+  if dtype is not None:
+    result = math_ops.cast(result, np_utils.result_type(dtype))
   return result
+
+
+def _geomspace_log10(x):
+  """`log10(x)` refined with one Newton step.
+
+  `log(x) / log(10)` is regularly an ulp or two off, e.g. it gives
+  2.9999999999999996 for x = 1000, and `geomspace` spreads that error over
+  every sample. One Newton step on `10**y - x` brings it back in line with
+  NumPy's `log10`. It is only applied to the (usually scalar) endpoints, so the
+  extra `pow` is cheap.
+
+  Args:
+    x: A tensor. Only real floating-point inputs are refined; anything else,
+      including complex inputs, goes to `log10` unchanged since `is_finite` has
+      no complex kernel.
+
+  Returns:
+    log10(x), with the same dtype as `x` for real floating-point inputs.
+  """
+  if not x.dtype.is_floating:
+    return log10(x)
+  # Stay in `x.dtype`: under NumPy-style promotion `log10(x)` can come back as
+  # float64 for a float32 `x`, which `pow` would then reject.
+  ten = constant_op.constant(10, dtype=x.dtype)
+  ln10 = math_ops.log(ten)
+  y = math_ops.log(x) / ln10
+  correction = (x - math_ops.pow(ten, y)) / (x * ln10)
+  # The correction is NaN for zero, negative and non-finite inputs, whose
+  # logarithm is left as is.
+  return array_ops.where_v2(math_ops.is_finite(correction), y + correction, y)
 
 
 @tf_export.tf_export('experimental.numpy.geomspace', v1=[])
@@ -1314,19 +1553,37 @@ def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis=0):  # pylint
   computation_dtype = np.promote_types(dtype.as_numpy_dtype, np.float32)
   start = np_array_ops.asarray(start, dtype=computation_dtype)
   stop = np_array_ops.asarray(stop, dtype=computation_dtype)
+  _validate_destination_axis(axis, start, stop)
   # follow the numpy geomspace convention for negative and complex endpoints
   start_sign = 1 - np_array_ops.sign(np_array_ops.real(start))
   stop_sign = 1 - np_array_ops.sign(np_array_ops.real(stop))
   signflip = 1 - start_sign * stop_sign // 2
   res = signflip * logspace(
-      log10(signflip * start),
-      log10(signflip * stop),
+      _geomspace_log10(signflip * start),
+      _geomspace_log10(signflip * stop),
       num,
       endpoint=endpoint,
       base=10.0,
       dtype=computation_dtype,
       axis=0,
   )
+  if num > 0:
+    # Like NumPy, make the endpoints match `start` and `stop` exactly. The
+    # round trip through log10 and pow does not reproduce them, and casting
+    # to an integer `dtype` would then truncate e.g. 999.9999999999991 to 999.
+    sample_shape = array_ops.shape(res)[1:]
+    first = array_ops.expand_dims(
+        array_ops.broadcast_to(math_ops.cast(start, res.dtype), sample_shape),
+        0,
+    )
+    if endpoint and num > 1:
+      last = array_ops.expand_dims(
+          array_ops.broadcast_to(math_ops.cast(stop, res.dtype), sample_shape),
+          0,
+      )
+      res = array_ops.concat([first, res[1:-1], last], axis=0)
+    else:
+      res = array_ops.concat([first, res[1:]], axis=0)
   if axis != 0:
     res = np_array_ops.moveaxis(res, 0, axis)
   return math_ops.cast(res, dtype)
@@ -1352,6 +1609,23 @@ def concatenate(arys, axis=0):  # pylint: disable=missing-function-docstring
     )
   dtype = np_utils.result_type(*arys)
   arys = [np_array_ops.array(array, dtype=dtype) for array in arys]
+  if axis is None:
+    # NumPy flattens every input before concatenating when axis is None.
+    # Reshaping an already flat array is a no-op, so skip the op dispatch.
+    arys = [
+        array if array.shape.ndims == 1 else array_ops.reshape(array, [-1])
+        for array in arys
+    ]
+    axis = 0
+  else:
+    maybe_rank = arys[0].shape.rank
+    if maybe_rank is not None:
+      normalized = axis + maybe_rank if axis < 0 else axis
+      if normalized < 0 or normalized >= maybe_rank:
+        raise ValueError(
+            f'Argument `axis` (received axis={axis}) is out of bounds '
+            f'for input {arys[0]} of rank {maybe_rank}.'
+        )
   return array_ops.concat(arys, axis)
 
 
@@ -1379,7 +1653,20 @@ def tile(a, reps):  # pylint: disable=missing-function-docstring
 @tf_export.tf_export('experimental.numpy.count_nonzero', v1=[])
 @np_utils.np_doc('count_nonzero')
 def count_nonzero(a, axis=None):
-  return math_ops.count_nonzero(np_array_ops.array(a), axis)
+  a = np_array_ops.array(a)
+  maybe_rank = a.shape.rank
+  if axis is not None and maybe_rank is not None:
+    # NumPy accepts axis 0 (and -1) on 0-d inputs.
+    validation_rank = max(maybe_rank, 1)
+    axes = axis if isinstance(axis, (tuple, list)) else (axis,)
+    for ax in axes:
+      normalized = ax + validation_rank if ax < 0 else ax
+      if normalized < 0 or normalized >= validation_rank:
+        raise ValueError(
+            f'Argument `axis` (received axis={ax}) is out of bounds '
+            f'for input {a} of rank {maybe_rank}.'
+        )
+  return math_ops.count_nonzero(a, axis)
 
 
 @tf_export.tf_export('experimental.numpy.argsort', v1=[])
@@ -1403,6 +1690,18 @@ def argsort(a, axis=-1, kind='quicksort', order=None):  # pylint: disable=missin
         'argsort does not support complex64/complex128 dtypes. '
         f'Received dtype: {a.dtype}'
     )
+
+  maybe_rank = a.shape.rank
+  if axis is not None and maybe_rank is not None:
+    # NumPy treats 0-d inputs as 1-D of size 1 for axis validation, so
+    # axes -1 and 0 are valid on scalars.
+    validation_rank = max(maybe_rank, 1)
+    normalized = axis + validation_rank if axis < 0 else axis
+    if normalized < 0 or normalized >= validation_rank:
+      raise ValueError(
+          f'Argument `axis` (received axis={axis}) is out of bounds '
+          f'for input {a} of rank {maybe_rank}.'
+      )
 
   def _argsort(a, axis, stable):
     if axis is None:
@@ -1437,6 +1736,15 @@ def sort(a, axis=-1, kind='quicksort', order=None):  # pylint: disable=missing-d
 
   a = np_array_ops.array(a)
 
+  maybe_rank = a.shape.rank
+  if axis is not None and maybe_rank is not None:
+    normalized = axis + maybe_rank if axis < 0 else axis
+    if normalized < 0 or normalized >= maybe_rank:
+      raise ValueError(
+          f'Argument `axis` (received axis={axis}) is out of bounds '
+          f'for input {a} of rank {maybe_rank}.'
+      )
+
   if axis is None:
     return sort_ops.sort(array_ops.reshape(a, [-1]), 0)
   else:
@@ -1450,6 +1758,20 @@ def _argminmax(fn, a, axis=None):
     a_t = array_ops.reshape(a, [-1])
   else:
     a_t = np_array_ops.atleast_1d(a)
+    # NumPy raises AxisError for out-of-bounds axes instead of letting the
+    # backend kernel fail with a confusing error.
+    maybe_rank = a_t.shape.rank
+    if (
+        maybe_rank is not None
+        and isinstance(axis, (int, np.integer))
+        and not bool(isinstance(axis, (bool, np.bool_)))
+    ):
+      normalized = axis + maybe_rank if axis < 0 else axis
+      if normalized < 0 or normalized >= maybe_rank:
+        raise ValueError(
+            f'Argument `axis` (received axis={axis}) is out of bounds '
+            f'for input of rank {maybe_rank}.'
+        )
   return fn(input=a_t, axis=axis)
 
 
@@ -1484,10 +1806,23 @@ def average(a, axis=None, weights=None, returned=False):  # pylint: disable=miss
         f'Received axis={axis} (of type {type(axis)})'
     )
   a = np_array_ops.array(a)
+  # NumPy raises AxisError for out-of-bounds axes instead of letting the
+  # backend kernel fail with a confusing error.
+  maybe_rank = a.shape.rank
+  if axis is not None and maybe_rank is not None:
+    if not (-maybe_rank <= axis < maybe_rank):
+      raise ValueError(
+          f'Argument `axis` (received axis={axis}) is out of bounds '
+          f'for input of rank {maybe_rank}.'
+      )
+    if axis < 0:
+      axis += maybe_rank
   default_float_type = np_utils.result_type(float)
   if weights is None:  # Treat all weights as 1
     if not np.issubdtype(a.dtype.as_numpy_dtype, np.inexact):
-      a = a.astype(np_utils.result_type(a.dtype, default_float_type))
+      # See the note in `_scalar`: `astype` is unavailable without the
+      # `enable_numpy_methods_on_tensor()` opt-in.
+      a = math_ops.cast(a, np_utils.result_type(a.dtype, default_float_type))
     avg = math_ops.reduce_mean(a, axis=axis)
     if returned:
       if axis is None:
@@ -1509,6 +1844,10 @@ def average(a, axis=None, weights=None, returned=False):  # pylint: disable=miss
           [array_ops.shape(a), array_ops.shape(weights)],
       )
       weights_sum = math_ops.reduce_sum(weights, axis=axis)
+      control_flow_assert.Assert(
+          math_ops.reduce_all(math_ops.not_equal(weights_sum, 0)),
+          ['Weights sum to zero, cannot be normalized.'],
+      )
       avg = math_ops.reduce_sum(a * weights, axis=axis) / weights_sum
       return avg, weights_sum
 
@@ -1521,6 +1860,10 @@ def average(a, axis=None, weights=None, returned=False):  # pylint: disable=miss
             array_ops.rank(weights) == 1, [array_ops.rank(weights)]
         )
         weights_sum = math_ops.reduce_sum(weights)
+        control_flow_assert.Assert(
+            math_ops.reduce_all(math_ops.not_equal(weights_sum, 0)),
+            ['Weights sum to zero, cannot be normalized.'],
+        )
         axes = ops.convert_to_tensor([[axis], [0]])
         avg = math_ops.tensordot(a, weights, axes) / weights_sum
         return avg, weights_sum
@@ -1548,16 +1891,10 @@ def trace(a, offset=0, axis1=0, axis2=1, dtype=None):  # pylint: disable=missing
   if dtype:
     dtype = np_utils.result_type(dtype)
   a = np_array_ops.asarray(a, dtype)
-
-  if offset == 0:
-    a_shape = a.shape
-    if a_shape.rank is not None:
-      rank = len(a_shape)
-      if (axis1 == -2 or axis1 == rank - 2) and (
-          axis2 == -1 or axis2 == rank - 1
-      ):
-        return math_ops.trace(a)
-
+  # There is deliberately no `math_ops.trace` shortcut here: it sums in the
+  # input dtype, so small integer inputs would overflow and bool inputs would
+  # fail, whereas `sum` promotes them the way NumPy does. `diagonal` already
+  # takes the `matrix_diag_part` fast path for the last two axes.
   a = np_array_ops.diagonal(a, offset, axis1, axis2)
   return np_array_ops.sum(a, -1, dtype)
 
@@ -1677,7 +2014,7 @@ def _enable_numpy_methods(tensor_class):
   setattr(tensor_class, 'reshape', np_array_ops._reshape_method_wrapper)  # pylint: disable=protected-access
   setattr(tensor_class, 'ravel', np_array_ops.ravel)
   setattr(tensor_class, 'clip', clip)
-  setattr(tensor_class, 'astype', math_ops.cast)
+  setattr(tensor_class, 'astype', np_array_ops._cast)  # pylint: disable=protected-access
   setattr(tensor_class, '__round__', np_array_ops.around)
   setattr(tensor_class, 'max', np_array_ops.amax)
   setattr(tensor_class, 'mean', np_array_ops.mean)

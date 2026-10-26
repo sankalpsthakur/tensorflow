@@ -1,11 +1,8 @@
 # hwloc: Portable Hardware Locality Library
 
-licenses(["notice"])
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
-config_setting(
-    name = "with_numa_support",
-    define_values = {"with_numa_support": "true"},
-)
+licenses(["notice"])
 
 filegroup(
     name = "COPYING",
@@ -14,9 +11,6 @@ filegroup(
 
 cc_library(
     name = "hwloc",
-    linkopts = select({
-        ":with_numa_support": ["-lhwloc"],
-        "//conditions:default": [],
-    }),
+    linkopts = ["-lhwloc"],
     visibility = ["//visibility:public"],
 )

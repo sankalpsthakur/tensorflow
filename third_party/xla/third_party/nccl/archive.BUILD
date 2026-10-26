@@ -30,6 +30,7 @@ load(
     "@local_config_nccl//:generated_names.bzl",
     "GENERATED_SOURCES",
 )
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_python//python:defs.bzl", "py_binary")
 
 licenses(["notice"])
@@ -38,7 +39,7 @@ exports_files(["LICENSE.txt"])
 
 NCCL_MAJOR = 2
 
-NCCL_MINOR = 29
+NCCL_MINOR = 30
 
 NCCL_PATCH = 7
 
@@ -232,7 +233,6 @@ cc_library(
         # from the virtual includes directory.
         "src/include/collectives.h",
         "src/nccl.h",
-        "src/ras/ras_internal.h",
     ],
     hdrs = ["src/nccl.h"],
     include_prefix = "third_party/nccl",

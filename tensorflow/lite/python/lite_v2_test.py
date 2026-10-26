@@ -195,6 +195,40 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     self.assertIsNotNone(tflite_model)
 
   @test_util.run_v2_only
+  def testUnsafeSingleBatchRankReductionConcatReshapeInterleave(self):
+    @tf.function(
+        input_signature=[
+            tf.TensorSpec(shape=[1, 2, 2, 4, 1], dtype=tf.float32),
+            tf.TensorSpec(shape=[1, 2, 2, 4, 1], dtype=tf.float32),
+        ]
+    )
+    def interleave(a, b):
+      return tf.reshape(tf.concat([a, b], axis=4), [1, 2, 2, 8])
+
+    root = autotrackable.AutoTrackable()
+    root.f = interleave
+    concrete_func = root.f.get_concrete_function()
+
+    converter = lite.TFLiteConverterV2.from_concrete_functions(
+        [concrete_func], root
+    )
+    converter._experimental_unsafe_single_batch_rank_reduction = True
+    tflite_model = converter.convert()
+
+    a = tf.constant(
+        np.arange(16, dtype=np.float32).reshape(1, 2, 2, 4, 1)
+    )
+    b = tf.constant(
+        np.arange(100, 116, dtype=np.float32).reshape(1, 2, 2, 4, 1)
+    )
+    expected_value = root.f(a, b)
+    interp = interpreter.Interpreter(model_content=tflite_model)
+    interp.allocate_tensors()
+    my_signature = interp.get_signature_runner()
+    actual_value = list(my_signature(a=a, b=b).values())[0]
+    self.assertAllClose(expected_value.numpy(), actual_value)
+
+  @test_util.run_v2_only
   def testMultiFunctionModel(self):
     """Convert a single model in a multi-functional model."""
     root = self._getMultiFunctionModel()
@@ -423,7 +457,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     # delegates (i.e. the XNNPACK delegate).
     interp = interpreter.Interpreter(
         model_content=quantized_model,
-        experimental_op_resolver_type=interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES,
+        experimental_op_resolver_type=(
+            interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+        ),
     )
     interp.allocate_tensors()
     # The model should have LOGISTIC op, instead of DEQUANTIZE op.
@@ -448,7 +484,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     # delegates (i.e. the XNNPACK delegate).
     interp = interpreter.Interpreter(
         model_content=quantized_model,
-        experimental_op_resolver_type=interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES,
+        experimental_op_resolver_type=(
+            interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+        ),
     )
     interp.allocate_tensors()
     # The model should have only one sqrt op.
@@ -487,7 +525,7 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     if is_int_only:
       if is_int16_quantize:
         quantized_converter.target_spec.supported_ops = [
-            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8
+            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
         ]
       else:
         quantized_converter.target_spec.supported_ops = [
@@ -496,7 +534,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     else:
       if is_int16_quantize:
         quantized_converter.target_spec.supported_ops = [
-            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8,
+            (
+                lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
+            ),
             lite.OpsSet.TFLITE_BUILTINS,
         ]
     quantized_converter.inference_input_type = inference_input_output_type
@@ -541,7 +581,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     quantized_converter.representative_dataset = calibration_gen
     if is_int16_quantize:
       quantized_converter.target_spec.supported_ops = [
-          lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8,
+          (
+              lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
+          ),
           lite.OpsSet.TFLITE_BUILTINS,
       ]
     with self.assertRaises(ValueError) as error:
@@ -945,7 +987,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     if is_int_only:
       if is_int16_quantize:
         quantized_converter.target_spec.supported_ops = [
-            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8,
+            (
+                lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
+            ),
             lite.OpsSet.SELECT_TF_OPS,
         ]
       else:
@@ -956,7 +1000,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     else:
       if is_int16_quantize:
         quantized_converter.target_spec.supported_ops = [
-            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8,
+            (
+                lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
+            ),
             lite.OpsSet.TFLITE_BUILTINS,
             lite.OpsSet.SELECT_TF_OPS,
         ]
@@ -1054,7 +1100,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     if is_int_only:
       if is_int16_quantize:
         quantized_converter.target_spec.supported_ops = [
-            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8,
+            (
+                lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
+            ),
             lite.OpsSet.TFLITE_BUILTINS,
         ]
       else:
@@ -1065,7 +1113,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     else:
       if is_int16_quantize:
         quantized_converter.target_spec.supported_ops = [
-            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8,
+            (
+                lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
+            ),
             lite.OpsSet.TFLITE_BUILTINS,
         ]
       else:
@@ -1168,7 +1218,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     if is_int_only:
       if is_int16_quantize:
         quantized_converter.target_spec.supported_ops = [
-            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8,
+            (
+                lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
+            ),
             lite.OpsSet.TFLITE_BUILTINS,
         ]
       else:
@@ -1179,7 +1231,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     else:
       if is_int16_quantize:
         quantized_converter.target_spec.supported_ops = [
-            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8,
+            (
+                lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
+            ),
             lite.OpsSet.TFLITE_BUILTINS,
         ]
       else:
@@ -1290,7 +1344,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     def examine_tflite_model(tflite_content, input_data):
       interp = interpreter.Interpreter(
           model_content=tflite_content,
-          experimental_op_resolver_type=interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES,
+          experimental_op_resolver_type=(
+              interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+          ),
       )
       interp.allocate_tensors()
       input_details = interp.get_input_details()
@@ -1440,7 +1496,7 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     ]
     quantized_converter.experimental_new_quantizer = enable_mlir_quantizer
     if disable_per_channel_for_dense:
-      quantized_converter._experimental_disable_per_channel_quantization_for_dense_layers = (
+      quantized_converter._experimental_disable_per_channel_quantization_for_dense_layers = (  # pylint: disable=line-too-long
           disable_per_channel_for_dense
       )
     quantized_tflite_model = quantized_converter.convert()
@@ -1449,7 +1505,9 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     # Do not apply delegates as XNNPack converts per tensor to per channel.
     interp = interpreter.Interpreter(
         model_content=quantized_tflite_model,
-        experimental_op_resolver_type=interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES,
+        experimental_op_resolver_type=(
+            interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+        ),
     )
     interp.allocate_tensors()
     detail = next((
@@ -1610,6 +1668,22 @@ class FromConcreteFunctionTest(lite_v2_test_util.ModelTest):
     # Check the debug metadata.
     metadata_names = [m.name for m in tflite_model.metadata]
     self.assertIn(b'debug_metadata', metadata_names)
+
+
+class MlirBytecodeConverterFlagsTest(test_util.TensorFlowTestCase):
+
+  def testFoldFp16CastsIntoFullyConnected(self):
+    converter = lite.TFLiteMlirBytecodeConverterV2(self.get_temp_dir())
+    flags = convert.build_conversion_flags(
+        **converter._get_base_converter_args()
+    )
+    self.assertFalse(flags.fold_fp16_casts_into_fully_connected)
+
+    converter._experimental_fold_fp16_casts_into_fully_connected = True
+    flags = convert.build_conversion_flags(
+        **converter._get_base_converter_args()
+    )
+    self.assertTrue(flags.fold_fp16_casts_into_fully_connected)
 
 
 class FromSavedModelTest(lite_v2_test_util.ModelTest):
@@ -1884,7 +1958,7 @@ class FromSavedModelTest(lite_v2_test_util.ModelTest):
 
     signature_def_map, init_op, assets_collection = (
         {
-            'serving_default': tf.compat.v1.saved_model.signature_def_utils.build_signature_def(
+            'serving_default': tf.compat.v1.saved_model.signature_def_utils.build_signature_def(  # pylint: disable=line-too-long
                 inputs={'x': tensor_info_x},
                 outputs={'y': tensor_info_y},
                 method_name='some_function',
@@ -1975,7 +2049,7 @@ class FromSavedModelTest(lite_v2_test_util.ModelTest):
 
     signature_def_map, init_op, assets_collection = (
         {
-            'serving_default': tf.compat.v1.saved_model.signature_def_utils.build_signature_def(
+            'serving_default': tf.compat.v1.saved_model.signature_def_utils.build_signature_def(  # pylint: disable=line-too-long
                 inputs={'x': tensor_info_x},
                 outputs={'y': tensor_info_y},
                 method_name='some_function',
@@ -2461,14 +2535,14 @@ class FromSavedModelTest(lite_v2_test_util.ModelTest):
     if is_int_only:
       if is_int16_quantize:
         converter.target_spec.supported_ops = [
-            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8
+            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
         ]
       else:
         converter.target_spec.supported_ops = [lite.OpsSet.TFLITE_BUILTINS_INT8]
     else:
       if is_int16_quantize:
         converter.target_spec.supported_ops = [
-            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8
+            lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
         ]
       else:
         converter.target_spec.supported_ops = [lite.OpsSet.TFLITE_BUILTINS]
@@ -2998,7 +3072,7 @@ class FromSavedModelTest(lite_v2_test_util.ModelTest):
 
     if is_int16_quantize:
       quantized_converter.target_spec.supported_ops = [
-          lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8
+          lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8  # pylint: disable=line-too-long
       ]
     else:
       quantized_converter.target_spec.supported_ops = [
@@ -3069,7 +3143,9 @@ class FromSavedModelTest(lite_v2_test_util.ModelTest):
     # Do not apply delegates as XNNPack converts per tensor to per channel.
     interp = interpreter.Interpreter(
         model_content=quantized_tflite_model,
-        experimental_op_resolver_type=interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES,
+        experimental_op_resolver_type=(
+            interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+        ),
     )
     interp.allocate_tensors()
     quantized_weight = None
@@ -3143,8 +3219,78 @@ class FromSavedModelTest(lite_v2_test_util.ModelTest):
       model = converter.convert()
       self.assertIsNotNone(model)
 
+  @test_util.run_v2_only
+  def testConvertDoesNotCallLoad(self):
+    """Regression test for https://github.com/tensorflow/tensorflow/issues/122598.
+
+    TFLiteSavedModelConverterV2.convert() used to call _load() internally just
+    to obtain graph_debug_info. For large models like DenseNet121, _load()
+    allocates ~25 MB of variable tensors and registers function defs in TF's
+    EagerContext. Reference cycles in the loaded object caused this memory to
+    leak across convert() calls (~22 MB/iter). The fix reads debug info directly
+    from the SavedModel directory via _parse_saved_model_with_debug_info()
+    instead of loading the full model.
+    """
+    from unittest import mock
+
+    root = autotrackable.AutoTrackable()
+    root.f = tf.function(lambda x: x * 2.0)
+    to_save = root.f.get_concrete_function(tf.TensorSpec([10], tf.float32))
+    save_dir = os.path.join(self.get_temp_dir(), 'saved_model_no_load')
+    save.save(root, save_dir, to_save)
+
+    converter = lite.TFLiteConverterV2.from_saved_model(save_dir)
+    # Patch _load at the lite module level to detect if it's called during
+    # convert(). The converter should NOT call _load() — it should read debug
+    # info directly from disk instead.
+    with mock.patch.object(lite, '_load', wraps=lite._load) as mock_load:
+      tflite_model = converter.convert()
+      mock_load.assert_not_called()
+
+    self.assertIsNotNone(tflite_model)
+    # Verify the converted model is runnable.
+    interp = interpreter.Interpreter(model_content=tflite_model)
+    interp.allocate_tensors()
+    input_details = interp.get_input_details()
+    output_details = interp.get_output_details()
+    interp.set_tensor(
+        input_details[0]['index'], np.ones([10], dtype=np.float32)
+    )
+    interp.invoke()
+    output = interp.get_tensor(output_details[0]['index'])
+    np.testing.assert_array_almost_equal(output, np.full([10], 2.0))
+
 
 class FromKerasModelTest(lite_v2_test_util.ModelTest):
+
+  @test_util.run_v2_only
+  def testSavedModelTracingErrorIncludesFallbackContext(self):
+    # This regression targets the legacy fallback conversion path.
+    if tf.keras.Model.__module__.startswith('keras.src'):
+      self.skipTest('The legacy Keras fallback is not used with Keras 3.')
+
+    class InvalidBroadcastModel(tf.keras.Model):
+
+      @tf.function(
+          input_signature=[tf.TensorSpec(shape=[1, 2, 2], dtype=tf.float32)]
+      )
+      def call(self, inputs):
+        values = tf.cos(tf.reshape(inputs, [1, -1]))
+        weights = tf.Variable([3.0, 4.0, 5.0, 6.0])
+        broadcast_weights = tf.broadcast_to(weights, [4, 4], [4])
+        return tf.matmul(values, broadcast_weights)
+
+    converter = lite.TFLiteConverterV2.from_keras_model(InvalidBroadcastModel())
+
+    with self.assertRaisesRegex(
+        convert.ConverterError,
+        'SavedModel export failed.*legacy Keras fallback tracing',
+    ) as error:
+      converter.convert()
+
+    self.assertIsInstance(error.exception.__cause__, TypeError)
+    self.assertIn(str(error.exception.__cause__), str(error.exception))
+    self.assertIsNone(converter._saved_model_export_error)
 
   @parameterized.named_parameters(
       ('EnableMlirVariableQuantizationNumState1', True, 1),
@@ -3418,7 +3564,9 @@ class FromKerasModelTest(lite_v2_test_util.ModelTest):
     # Do not apply delegates as XNNPack converts per tensor to per channel.
     interp = interpreter.Interpreter(
         model_content=quantized_tflite_model,
-        experimental_op_resolver_type=interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES,
+        experimental_op_resolver_type=(
+            interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+        ),
     )
     interp.allocate_tensors()
     quantized_weight = None
@@ -3660,7 +3808,7 @@ class FromKerasModelTest(lite_v2_test_util.ModelTest):
     ]
     quantized_converter.experimental_new_quantizer = enable_mlir_quantizer
     if disable_per_channel_for_dense:
-      quantized_converter._experimental_disable_per_channel_quantization_for_dense_layers = (
+      quantized_converter._experimental_disable_per_channel_quantization_for_dense_layers = (  # pylint: disable=line-too-long
           disable_per_channel_for_dense
       )
     quantized_tflite_model = quantized_converter.convert()
@@ -3669,7 +3817,9 @@ class FromKerasModelTest(lite_v2_test_util.ModelTest):
     # Do not apply delegates as XNNPack converts per tensor to per channel.
     interp = interpreter.Interpreter(
         model_content=quantized_tflite_model,
-        experimental_op_resolver_type=interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES,
+        experimental_op_resolver_type=(
+            interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+        ),
     )
     interp.allocate_tensors()
     detail = next(
@@ -3680,6 +3830,26 @@ class FromKerasModelTest(lite_v2_test_util.ModelTest):
     self.assertLen(quant_params['scales'], expected_num_params)
     if len(quant_params['zero_points']) != 1:
       self.assertLen(quant_params['zero_points'], expected_num_params)
+
+  def testKerasMultipleTfFunctions(self):
+    class Model(tf.keras.Model):
+
+      def __init__(self):
+        super().__init__()
+        self.bias = tf.Variable([2.0], dtype=tf.float32)
+
+      @tf.function(input_signature=[tf.TensorSpec(shape=[1], dtype=tf.float32)])
+      def call(self, x):
+        return x + self.bias
+
+      @tf.function(input_signature=[tf.TensorSpec(shape=[1], dtype=tf.float32)])
+      def other_signature(self, x):
+        return x * 2.0
+
+    model = Model()
+    converter = lite.TFLiteConverterV2.from_keras_model(model)
+    tflite_model = converter.convert()
+    self.assertIsNotNone(tflite_model)
 
 
 class FromJaxModelTest(lite_v2_test_util.ModelTest):
@@ -5341,7 +5511,7 @@ class SparsityTest(lite_v2_test_util.ModelTest):
         lite.Optimize.DEFAULT,
     ]
     quantized_converter.representative_dataset = calibration_gen
-    quantized_converter._experimental_disable_per_channel_quantization_for_dense_layers = (
+    quantized_converter._experimental_disable_per_channel_quantization_for_dense_layers = (  # pylint: disable=line-too-long
         disable_per_channel_quantization_for_dense_layers
     )
     quantized_tflite_model = quantized_converter.convert()
@@ -5470,6 +5640,86 @@ class BufferOffsetTest(lite_v2_test_util.ModelTest):
     # Check output value from converted model.
     expected_value = root.f(input_data)
     actual_value = self._evaluateTFLiteModel(tflite_model, [input_data])
+    self.assertEqual(expected_value.numpy(), actual_value)
+
+  @test_util.run_v2_only
+  def testUseBufferOffsetAlignment(self):
+    """Test that all external constant buffers are aligned to 16 bytes."""
+
+    class MultiConstantModel(tf.Module):
+
+      def __init__(self):
+        super().__init__()
+        # Constants with non-multiple-of-16 byte sizes to test padding alignment
+        self.w1 = tf.Variable(
+            tf.ones([3, 1], dtype=tf.float32), name='w1'
+        )  # 3 * 4 = 12 bytes
+        self.w2 = tf.Variable(
+            tf.ones([5, 1], dtype=tf.float32), name='w2'
+        )  # 5 * 4 = 20 bytes
+        self.w3 = tf.Variable(
+            tf.ones([1, 1], dtype=tf.float32), name='w3'
+        )  # 1 * 4 = 4 bytes
+        self.w4 = tf.Variable(
+            tf.ones([7, 1], dtype=tf.float32), name='w4'
+        )  # 7 * 4 = 28 bytes
+        self.w5 = tf.Variable(
+            tf.ones([6, 1], dtype=tf.float32), name='w5'
+        )  # 6 * 4 = 24 bytes
+
+      @tf.function
+      def __call__(self, x1, x2, x3, x4, x5):
+        return (
+            tf.matmul(x1, self.w1)
+            + tf.matmul(x2, self.w2)
+            + tf.matmul(x3, self.w3)
+            + tf.matmul(x4, self.w4)
+            + tf.matmul(x5, self.w5)
+        )
+
+    root = MultiConstantModel()
+    inputs = [
+        tf.constant([[1.0, 2.0, 3.0]], dtype=tf.float32),
+        tf.constant([[1.0, 2.0, 3.0, 4.0, 5.0]], dtype=tf.float32),
+        tf.constant([[1.0]], dtype=tf.float32),
+        tf.constant([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]], dtype=tf.float32),
+        tf.constant([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]], dtype=tf.float32),
+    ]
+    concrete_func = root.__call__.get_concrete_function(*inputs)
+
+    converter = lite.TFLiteConverterV2.from_concrete_functions(
+        [concrete_func], root
+    )
+    converter._experimental_use_buffer_offset = True
+    tflite_model = converter.convert()
+
+    # Parse flatbuffer model and check all buffer offsets
+    model_obj = schema_fb.Model.GetRootAsModel(tflite_model, 0)
+    external_buffer_count = 0
+    for i in range(model_obj.BuffersLength()):
+      buf = model_obj.Buffers(i)
+      if buf.Offset() > 1:
+        external_buffer_count += 1
+        self.assertEqual(
+            buf.Offset() % 16,
+            0,
+            f'Buffer {i} offset {buf.Offset()} is not 16-byte aligned (offset %'
+            f' 16 = {buf.Offset() % 16})',
+        )
+    self.assertGreaterEqual(external_buffer_count, 5)
+
+    # Evaluate converted model
+    expected_value = root(*inputs)
+    interp = interpreter.Interpreter(model_content=tflite_model)
+    runner = interp.get_signature_runner()
+    output = runner(
+        x1=inputs[0],
+        x2=inputs[1],
+        x3=inputs[2],
+        x4=inputs[3],
+        x5=inputs[4],
+    )
+    actual_value = list(output.values())[0]
     self.assertEqual(expected_value.numpy(), actual_value)
 
   @test_util.run_v2_only

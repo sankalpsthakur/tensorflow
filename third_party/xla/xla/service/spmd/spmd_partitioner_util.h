@@ -30,9 +30,9 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
@@ -487,7 +487,8 @@ HloInstruction* PerGroupSliceFromReplicated(
     HloInstruction* replicated, HloInstruction* partition_id,
     const hlo_sharding_util::DeviceGroupTileAssignment& device_groups,
     absl::Span<const int64_t> group_dims,
-    absl::Span<const int64_t> group_dim_sizes, SpmdBuilder* b);
+    absl::Span<const int64_t> group_dim_sizes, SpmdBuilder* b,
+    std::optional<Literal> pad_value = std::nullopt);
 
 // Pad the shape from partial replicate shape for `dst_sharding`.
 // If dst_sharding needs more padding and per_shard_size increased in

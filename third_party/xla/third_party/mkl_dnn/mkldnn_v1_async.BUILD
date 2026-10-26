@@ -15,6 +15,7 @@
 
 load("@bazel_skylib//rules:expand_template.bzl", "expand_template")
 load("@local_config_sycl//sycl:build_defs.bzl", "if_sycl", "if_sycl_build_is_configured", "sycl_library")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@xla//xla/tsl:tsl.bzl", "tf_openmp_copts")
 load("@xla//xla/tsl/mkl:build_defs.bzl", "if_mkl", "if_mkl_ml", "if_mkldnn_openmp")
 load("@xla//xla/tsl/mkl:build_defs_gpu.bzl", "convert_cl_to_cpp", "convert_header_to_cpp")
@@ -28,6 +29,7 @@ _CMAKE_COMMON_LIST = {
     "#cmakedefine ONEDNN_BUILD_GRAPH": "#define ONEDNN_BUILD_GRAPH",
     "#cmakedefine DNNL_EXPERIMENTAL_SPARSE": "#define DNNL_EXPERIMENTAL_SPARSE",
     "#cmakedefine DNNL_EXPERIMENTAL": "#undef DNNL_EXPERIMENTAL",
+    "#cmakedefine01 DNNL_EXPERIMENTAL_GROUPED_MEMORY": "#undef DNNL_EXPERIMENTAL_GROUPED_MEMORY",
     "#cmakedefine DNNL_SAFE_RBP": "#undef DNNL_SAFE_RBP",
     "#cmakedefine01 BUILD_TRAINING": "#define BUILD_TRAINING 1",
     "#cmakedefine01 BUILD_INFERENCE": "#define BUILD_INFERENCE 0",
@@ -38,6 +40,7 @@ _CMAKE_COMMON_LIST = {
     "#cmakedefine01 BUILD_CONVOLUTION": "#define BUILD_CONVOLUTION 0",
     "#cmakedefine01 BUILD_DECONVOLUTION": "#define BUILD_DECONVOLUTION 0",
     "#cmakedefine01 BUILD_ELTWISE": "#define BUILD_ELTWISE 0",
+    "#cmakedefine01 BUILD_GATED_MLP": "#define BUILD_GATED_MLP 0",
     "#cmakedefine01 BUILD_GEMM_KERNELS_ALL": "#define BUILD_GEMM_KERNELS_ALL 1",
     "#cmakedefine01 BUILD_GEMM_KERNELS_NONE": "#define BUILD_GEMM_KERNELS_NONE 0",
     "#cmakedefine01 BUILD_GEMM_SSE41": "#define BUILD_GEMM_SSE41 1",
@@ -66,6 +69,7 @@ _CMAKE_COMMON_LIST = {
     "#cmakedefine01 BUILD_GEN11": "#define BUILD_GEN11 0",
     "#cmakedefine01 BUILD_SDPA": "#define BUILD_SDPA 1",
     "#cmakedefine01 BUILD_XE2": "#define BUILD_XE2 0",
+    "#cmakedefine01 BUILD_XE3P": "#define BUILD_XE3P 0",
     "#cmakedefine01 BUILD_XE3": "#define BUILD_XE3 0",
     "#cmakedefine01 BUILD_XELP": "#define BUILD_XELP 0",
     "#cmakedefine01 BUILD_XEHPG": "#define BUILD_XEHPG 0",
@@ -131,9 +135,9 @@ expand_template(
     out = "include/oneapi/dnnl/dnnl_version.h",
     substitutions = {
         "@DNNL_VERSION_MAJOR@": "3",
-        "@DNNL_VERSION_MINOR@": "11",
+        "@DNNL_VERSION_MINOR@": "12",
         "@DNNL_VERSION_PATCH@": "3",
-        "@DNNL_VERSION_HASH@": "N/A",
+        "@DNNL_VERSION_HASH@": "6db5f1ba860ca8f65c3f65c4498ad867e9642447",
     },
     template = "include/oneapi/dnnl/dnnl_version.h.in",
 )
@@ -142,7 +146,7 @@ expand_template(
     name = "dnnl_version_hash_h",
     out = "include/oneapi/dnnl/dnnl_version_hash.h",
     substitutions = {
-        "@DNNL_VERSION_HASH@": "74d04752d9eaefff6a9ff62466c4d20b155e5bca",
+        "@DNNL_VERSION_HASH@": "6db5f1ba860ca8f65c3f65c4498ad867e9642447",
     },
     template = "include/oneapi/dnnl/dnnl_version_hash.h.in",
 )
@@ -221,6 +225,7 @@ _TEXTUAL_HDRS_LIST = glob([
         "src/xpu/ocl/capi/*.hpp",
         "src/xpu/sycl/*.hpp",
         "src/xpu/sycl/capi/*.hpp",
+        "src/xpu/ze/*.hpp",
         "third_party/ngen/*.hpp",
         "third_party/ngen/**/*.hpp",
     ],
@@ -331,6 +336,7 @@ sycl_library(
             "src/xpu/sycl/capi/*.cpp",
             "src/xpu/ocl/*.cpp",
             "src/xpu/ocl/capi/*.cpp",
+            "src/xpu/ze/*.cpp",
             "src/gpu/*.cpp",
             "src/gpu/generic/*.cpp",
             "src/gpu/intel/*.cpp",
@@ -359,6 +365,7 @@ sycl_library(
         "-DDNNL_ENABLE_JIT_DUMP=0",
         "-DGEMMSTONE_BUILD_XE2",
         "-DGEMMSTONE_BUILD_XE3",
+        "-DGEMMSTONE_BUILD_XE3P",
         "-DGEMMSTONE_BUILD_12P8",
         "-DGEMMSTONE_BUILD_12P7",
         "-DGEMMSTONE_BUILD_12HP",

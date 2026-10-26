@@ -33,6 +33,8 @@ ALL_FILES_WITH_EXTENSIONS = glob(["**/*.*"])
 EIGEN_HEADERS = glob(
     [
         "Eigen/*",
+        "contrib/Eigen/*",
+        "contrib/Eigen/CXX11/*",
         "unsupported/Eigen/*",
         "unsupported/Eigen/CXX11/*",
     ],
@@ -46,6 +48,8 @@ EIGEN_SOURCES = glob(
     [
         "Eigen/**/src/**/*.h",
         "Eigen/**/src/**/*.inc",
+        "contrib/Eigen/**/src/**/*.h",
+        "contrib/Eigen/**/src/**/*.inc",
         "unsupported/Eigen/**/src/**/*.h",
         "unsupported/Eigen/**/src/**/*.inc",
     ],
@@ -77,4 +81,27 @@ filegroup(
     name = "eigen_source_files",
     srcs = EIGEN_SOURCES,
     visibility = ["//visibility:public"],
+)
+
+# ==============================================================================
+# Eigen BLAS Library (:blas)
+# ==============================================================================
+
+cc_library(
+    name = "blas",
+    srcs = glob([
+        "blas/*.cpp",
+        "blas/*.h",
+    ]) + [
+        "Eigen/src/Core/util/blas.h",
+    ],
+    hdrs = ["blas/blas.h"],
+    copts = ["-O3"],
+    includes = [
+        "blas",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":eigen3",
+    ],
 )

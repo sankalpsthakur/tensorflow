@@ -26,9 +26,9 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
@@ -205,10 +205,8 @@ absl::StatusOr<mlir::func::FuncOp> EmitKernelApi(
   builder.setInsertionPointToStart(module.getBody());
   auto entry_func = builder.create<mlir::func::FuncOp>(
       entry_function_name,
-      mlir::FunctionType::get(context, param_types, result_types),
-      /*sym_visibility=*/mlir::StringAttr{},
-      mlir::ArrayAttr::get(context, arg_attrs),
-      /*res_attrs=*/mlir::ArrayAttr{});
+      mlir::FunctionType::get(context, param_types, result_types));
+  entry_func.setArgAttrsAttr(mlir::ArrayAttr::get(context, arg_attrs));
   entry_func->setAttr(kXlaEntryAttr, mlir::UnitAttr::get(context));
 
   return entry_func;

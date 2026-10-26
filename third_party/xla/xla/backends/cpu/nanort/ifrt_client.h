@@ -27,7 +27,6 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "llvm/Support/ExtensibleRTTI.h"
 #include "xla/backends/cpu/nanort/nanort_client.h"
 #include "xla/pjrt/pjrt_layout.h"
 #include "xla/python/ifrt/array.h"
@@ -43,6 +42,7 @@ limitations under the License.
 #include "xla/python/ifrt/layout.h"
 #include "xla/python/ifrt/memory.h"
 #include "xla/python/ifrt/remap_plan.h"
+#include "xla/python/ifrt/rtti.h"
 #include "xla/python/ifrt/shape.h"
 #include "xla/python/ifrt/sharding.h"
 #include "xla/python/ifrt/topology.h"
@@ -81,7 +81,8 @@ struct NanoIfrtOptions {
 // buffers directly in the future, this would allow the "load path" that
 // initializes programs and variables to be reused while still getting the
 // performance wins of NanoRt at execution time.
-class NanoIfrtClient : public llvm::RTTIExtends<NanoIfrtClient, ifrt::Client> {
+class NanoIfrtClient
+    : public xla::ifrt::RTTIExtends<NanoIfrtClient, ifrt::Client> {
  public:
   ~NanoIfrtClient() override;
 
@@ -131,6 +132,10 @@ class NanoIfrtClient : public llvm::RTTIExtends<NanoIfrtClient, ifrt::Client> {
       const absl::Status& error,
       absl::Span<const ifrt::ArraySpec> array_specs) override;
 
+  absl::StatusOr<std::vector<tsl::Future<>>> CopyArraysToHostBufferShards(
+      absl::Span<CopyArraysToHostBufferShardsSpec> specs,
+      ifrt::ArrayCopySemantics semantics) override;
+
   // Assembles a sharded array from a list of single device arrays. If the
   // provided sharding is specific enough to assemble a dense array, this method
   // will actually return an assembled array that pretends it is sharded.
@@ -147,6 +152,11 @@ class NanoIfrtClient : public llvm::RTTIExtends<NanoIfrtClient, ifrt::Client> {
       absl::Span<ifrt::ArrayRef> arrays,
       std::optional<ifrt::DeviceListRef> devices,
       std::optional<ifrt::MemoryKind> memory_kind,
+      ifrt::ArrayCopySemantics semantics) override;
+
+  absl::StatusOr<std::vector<ifrt::ArrayRef>> CopyArraysWithDonatedDst(
+      absl::Span<ifrt::ArrayRef> arrays,
+      absl::Span<ifrt::ArrayRef> donated_dst_arrays,
       ifrt::ArrayCopySemantics semantics) override;
 
   absl::StatusOr<std::vector<ifrt::ArrayRef>> RemapArrays(
@@ -214,6 +224,10 @@ class NanoIfrtClient : public llvm::RTTIExtends<NanoIfrtClient, ifrt::Client> {
       absl::Span<ifrt::Device* const> devices) const override;
 
   ifrt::Compiler* GetDefaultCompiler() override;
+
+  absl::StatusOr<std::vector<tsl::Future<ifrt::LoadedExecutableRef>>> Load(
+      absl::Span<const ifrt::ExecutableRef> executables,
+      absl::Span<std::unique_ptr<ifrt::LoadOptions>> options) override;
 
   absl::StatusOr<std::shared_ptr<ifrt::Topology>> GetTopologyForDevices(
       const ifrt::DeviceListRef& devices) const override;

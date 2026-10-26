@@ -30,12 +30,12 @@
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/pjrt/host_memory_spaces.h"
 #include "xla/pjrt/pjrt_device_description.h"
 #include "xla/pjrt/pjrt_layout.h"
@@ -45,9 +45,11 @@
 #include "xla/python/ifrt/attribute_map.h"
 #include "xla/python/ifrt/basic_device_list.h"
 #include "xla/python/ifrt/client.h"
+#include "xla/python/ifrt/client_impl_util.h"
 #include "xla/python/ifrt/device.h"
 #include "xla/python/ifrt/device_list.h"
 #include "xla/python/ifrt/dtype.h"
+#include "xla/python/ifrt/executable.h"
 #include "xla/python/ifrt/layout.h"
 #include "xla/python/ifrt/memory.h"
 #include "xla/python/ifrt/remap_plan.h"
@@ -57,6 +59,7 @@
 #include "xla/python/ifrt/value.h"
 #include "xla/python/ifrt_proxy/client/array.h"
 #include "xla/python/ifrt_proxy/client/device.h"
+#include "xla/python/ifrt_proxy/client/executable.h"
 #include "xla/python/ifrt_proxy/client/memory.h"
 #include "xla/python/ifrt_proxy/client/rpc_helper.h"
 #include "xla/python/ifrt_proxy/common/ifrt_service.pb.h"
@@ -67,6 +70,7 @@
 #include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/concurrency/ref_count.h"
 #include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/status_to_from_proto.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/casts.h"
@@ -259,6 +263,12 @@ absl::StatusOr<std::vector<xla::ifrt::ArrayRef>> Client::MakeErrorArrays(
   return Array::MakeErrorArrays(this, rpc_helper_, error, array_specs);
 }
 
+absl::StatusOr<std::vector<tsl::Future<>>> Client::CopyArraysToHostBufferShards(
+    absl::Span<CopyArraysToHostBufferShardsSpec> specs,
+    ArrayCopySemantics semantics) {
+  return xla::ifrt::ClientCopyArraysToHostBufferShards(this, specs, semantics);
+}
+
 absl::StatusOr<xla::ifrt::ArrayRef> Client::AssembleArrayFromSingleDeviceArrays(
     DType dtype, Shape shape, ShardingRef sharding,
     absl::Span<xla::ifrt::ArrayRef> arrays,
@@ -315,11 +325,11 @@ absl::StatusOr<std::vector<xla::ifrt::ArrayRef>> Client::CopyArrays(
       req->add_device_ids(device->Id().value());
     }
   }
-  if (memory_kind.has_value()) {
-    // Use an empty string to indicate the default memory kind.
+  if (memory_kind.has_value() &&
+      *memory_kind != arrays[0]->sharding().memory_kind()) {
     // OSS requires explicit string conversion
     // NOLINTNEXTLINE(*-redundant-string-conversions)
-    req->set_memory_kind(std::string(memory_kind->memory_kind().value_or("")));
+    req->set_memory_kind(std::string(memory_kind->value()));
   }
   req->set_copy_semantics(ToArrayCopySemanticsProto(semantics));
 
@@ -332,18 +342,23 @@ absl::StatusOr<std::vector<xla::ifrt::ArrayRef>> Client::CopyArrays(
     auto* proxy_array = cast<xla::ifrt::proxy::Array>(arrays[i].get());
     CHECK(proxy_array != nullptr);
     std::shared_ptr<const xla::PjRtLayout> layout;
-    bool force_default_layout = false;
+    bool propagate_layout = true;
     if (memory_kind.has_value() &&
-        memory_kind->memory_kind() == xla::UnpinnedHostMemorySpace::kKind) {
+        memory_kind->value() == xla::UnpinnedHostMemorySpace::kKind) {
       // "unpinned_host" memory only supports the default layout.
-      force_default_layout = true;
-    } else if (devices.has_value() &&
-               (*devices)->devices().front()->PlatformName() ==
-                   xla::CpuPlatformName()) {
-      // "cpu" device only supports the default layout.
-      force_default_layout = true;
+      propagate_layout = false;
+    } else if (devices.has_value()) {
+      absl::string_view src_platform =
+          arrays[i]->sharding().devices()->devices().front()->PlatformName();
+      absl::string_view dst_platform =
+          (*devices)->devices().front()->PlatformName();
+      if (src_platform != dst_platform) {
+        // Do not propagate the source layout if the device platforms differ
+        // (e.g. CPU -> TPU or TPU -> CPU).
+        propagate_layout = false;
+      }
     }
-    if (!force_default_layout) {
+    if (propagate_layout) {
       ABSL_ASSIGN_OR_RETURN(layout, proxy_array->pjrt_layout());
     }
     uint64_t result_handle = rpc_helper_->NextHandle();
@@ -454,6 +469,32 @@ tsl::Future<> Client::DeleteValues(absl::Span<xla::ifrt::ValueRef> values) {
   return tsl::JoinFutures(futures);
 }
 
+void Client::CancelExecution(
+    xla::ifrt::LoadedExecutable::CancellationHandle cancellation_handle,
+    absl::Status error) {
+  tsl::profiler::TraceMe traceme_ifrt_entrypoint(
+      "IfrtProxyEntrypointCancelExecution");
+  CHECK(!error.ok());
+  if (rpc_helper_->protocol_version() < protocol_version::kCancelExecution) {
+    return;
+  }
+  auto* proxy_handle =
+      dynamic_cast<proxy::CancellationHandle*>(cancellation_handle.get());
+  if (proxy_handle == nullptr) {
+    return;
+  }
+  auto req = std::make_unique<CancelExecutionRequest>();
+  req->set_cancellation_handle(proxy_handle->handle());
+  *req->mutable_error() = tsl::StatusToProto(error);
+  rpc_helper_->CancelExecution(std::move(req))
+      .OnReady([](absl::StatusOr<std::shared_ptr<CancelExecutionResponse>>
+                      response) {
+        if (!response.ok()) {
+          LOG(ERROR) << "Failed to cancel execution: " << response.status();
+        }
+      });
+}
+
 absl::Span<xla::ifrt::Device* const> Client::GetAllDevices() const {
   return all_device_ptrs_;
 }
@@ -509,8 +550,10 @@ Client::GetDefaultPjRtLayout(xla::ifrt::DType dtype,
   }
   req->set_device_id(device->Id().value());
   // OSS requires explicit string conversion
-  // NOLINTNEXTLINE(*-redundant-string-conversions)
-  req->set_memory_kind(std::string(memory_kind.memory_kind().value_or("")));
+  if (!memory_kind.is_default()) {
+    // NOLINTNEXTLINE(*-redundant-string-conversions)
+    req->set_memory_kind(std::string(memory_kind.value()));
+  }
 
   auto future = rpc_helper_->GetDefaultLayout(std::move(req));
   ABSL_ASSIGN_OR_RETURN(auto response, future.Await());

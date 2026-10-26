@@ -19,7 +19,6 @@ limitations under the License.
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -36,6 +35,7 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
@@ -45,7 +45,6 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/comparison_util.h"
 #include "xla/hlo/ir/collective_op_group_mode.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
@@ -56,12 +55,12 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/ir/hlo_schedule.h"
+#include "xla/hlo/transforms/collectives/collective_permute_cycle.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/permutation_util.h"
 #include "xla/primitive_util.h"
 #include "xla/service/collective_ops_utils.h"
-#include "xla/service/collective_permute_cycle.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/matmul_indexing_utils.h"
 #include "xla/service/shape_inference.h"
@@ -74,6 +73,7 @@ limitations under the License.
 #include "xla/tsl/platform/errors.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
+#include "tsl/platform/platform.h"
 
 namespace xla {
 namespace {
@@ -131,7 +131,7 @@ absl::Status ShapeVerifier::Preprocess(HloInstruction* hlo) {
     return InvalidArgument("Unbounded dynamism is disabled for instruction: %s",
                            hlo->ToString());
   }
-  if (hlo->shape().has_layout()) {
+  if (opts_.layout_sensitive && hlo->shape().has_layout()) {
     if (hlo->shape().layout().minor_to_major().size() !=
         hlo->shape().dimensions().size()) {
       return InvalidArgument(
@@ -153,6 +153,10 @@ absl::Status ShapeVerifier::HandleElementwiseBinary(HloInstruction* hlo) {
 
 absl::Status ShapeVerifier::HandleClamp(HloInstruction* clamp) {
   return CheckTernaryShape(clamp);
+}
+
+absl::Status ShapeVerifier::HandleFma(HloInstruction* fma) {
+  return CheckTernaryShape(fma);
 }
 
 absl::Status ShapeVerifier::HandleSelect(HloInstruction* select) {
@@ -192,12 +196,73 @@ absl::Status ShapeVerifier::HandleCopy(HloInstruction* copy) {
   return CheckUnaryShape(copy);
 }
 
+absl::Status VerifySparsityAndBlockScaling(const HloInstruction* hlo) {
+  if (hlo->operand_count() < 2) {
+    return InvalidArgument("%s must have at least 2 operands, got %d",
+                           HloOpcodeString(hlo->opcode()),
+                           hlo->operand_count());
+  }
+  std::vector<char> seen_indices(hlo->operand_count(), false);
+  int64_t seen_count = 0;
+  auto check_idx = [&](int32_t idx, absl::string_view desc) -> absl::Status {
+    if (idx < 2 || idx >= hlo->operand_count()) {
+      return InvalidArgument("%s %d out of bounds", desc, idx);
+    }
+    if (!hlo->operand(idx)->shape().IsArray()) {
+      return InvalidArgument(
+          "Expected array argument for %s at index %d, but got %s", desc, idx,
+          ShapeUtil::HumanString(hlo->operand(idx)->shape()));
+    }
+    if (seen_indices[idx]) {
+      return InvalidArgument("Duplicate index %d for %s", idx, desc);
+    }
+    seen_indices[idx] = true;
+    ++seen_count;
+    return absl::OkStatus();
+  };
+
+  if (hlo->sparsity_config().has_lhs()) {
+    ABSL_RETURN_IF_ERROR(
+        check_idx(hlo->sparsity_config().lhs().idx(), "Sparsity idx for lhs"));
+  }
+  if (hlo->sparsity_config().has_rhs()) {
+    ABSL_RETURN_IF_ERROR(
+        check_idx(hlo->sparsity_config().rhs().idx(), "Sparsity idx for rhs"));
+  }
+  if (hlo->block_scaling_config().has_lhs()) {
+    ABSL_RETURN_IF_ERROR(check_idx(hlo->block_scaling_config().lhs().scale_idx(),
+                              "Block scaling scale_idx for lhs"));
+    if (hlo->block_scaling_config().lhs().has_zero_idx()) {
+      ABSL_RETURN_IF_ERROR(check_idx(hlo->block_scaling_config().lhs().zero_idx(),
+                                "Block scaling zero_idx for lhs"));
+    }
+  }
+  if (hlo->block_scaling_config().has_rhs()) {
+    ABSL_RETURN_IF_ERROR(check_idx(hlo->block_scaling_config().rhs().scale_idx(),
+                              "Block scaling scale_idx for rhs"));
+    if (hlo->block_scaling_config().rhs().has_zero_idx()) {
+      ABSL_RETURN_IF_ERROR(check_idx(hlo->block_scaling_config().rhs().zero_idx(),
+                                "Block scaling zero_idx for rhs"));
+    }
+  }
+  if (seen_count != hlo->operand_count() - 2) {
+    return InvalidArgument(
+        "Expected all %d extra operands to be referenced by sparsity_config or "
+        "block_scaling_config, but %d were referenced",
+        hlo->operand_count() - 2, seen_count);
+  }
+
+  return absl::OkStatus();
+}
+
 absl::Status ShapeVerifier::HandleDot(HloInstruction* dot) {
+  ABSL_RETURN_IF_ERROR(VerifySparsityAndBlockScaling(dot));
   ABSL_ASSIGN_OR_RETURN(const Shape expected,
                    ShapeInference::InferDotOpShape(
                        dot->operand(0)->shape(), dot->operand(1)->shape(),
                        dot->dot_dimension_numbers(),
-                       /*preferred_element_type=*/dot->shape().element_type()));
+                       /*preferred_element_type=*/dot->shape().element_type(),
+                       dot->sparsity_config()));
 
   return CheckShape(dot, expected);
 }
@@ -304,6 +369,8 @@ absl::Status ShapeVerifier::HandleScaledDot(HloInstruction* scaled_dot) {
 }
 
 absl::Status ShapeVerifier::HandleConvolution(HloInstruction* convolution) {
+  ABSL_RETURN_IF_ERROR(VerifySparsityAndBlockScaling(convolution));
+
   ABSL_ASSIGN_OR_RETURN(
       Shape expected,
       ShapeInference::InferConvolveShape(
@@ -400,12 +467,12 @@ static absl::Status CheckReplicaGroups(HloInstruction* hlo,
     // on the second pass we only add to `seen_replica_ids` iff we see a replica
     // id in the range [0, n) for the first time. So, there is no need to check
     // that all `seen_replica_ids` values are true.
-#ifndef NDEBUG
-    for (int64_t i = 0; i < n; ++i) {
-      CHECK(seen_replica_ids[i])
-          << "Programming error: seen_replica_ids[" << i << "] is false!";
+    if constexpr (tsl::kIsDebugBuild) {
+      for (int64_t i = 0; i < n; ++i) {
+        CHECK(seen_replica_ids[i])
+            << "Programming error: seen_replica_ids[" << i << "] is false!";
+      }
     }
-#endif  // NDEBUG
 
     // replica-groups have numbers [0, n). This n should be either replica or
     // partition count, or their product. In some cases, replica and/or
@@ -661,9 +728,22 @@ absl::Status ShapeVerifier::HandleAllToAll(HloInstruction* hlo) {
                  *all_to_all->split_dimension(), split_count));
   }
   TF_RET_CHECK(hlo->operand_count() == split_count);
+  // InferAllToAllTupleShape compares operand layouts, so strip them if layouts
+  // haven't been assigned.
+  const bool compare_layouts =
+      opts_.layout_sensitive || all_to_all->constrain_layout();
+  std::vector<Shape> operand_shapes_storage;
+  operand_shapes_storage.reserve(hlo->operand_count());
   std::vector<const Shape*> operand_shapes;
+  operand_shapes.reserve(hlo->operand_count());
   for (const HloInstruction* operand : hlo->operands()) {
-    operand_shapes.push_back(&operand->shape());
+    if (compare_layouts) {
+      operand_shapes.push_back(&operand->shape());
+    } else {
+      operand_shapes_storage.push_back(operand->shape());
+      LayoutUtil::ClearLayout(&operand_shapes_storage.back());
+      operand_shapes.push_back(&operand_shapes_storage.back());
+    }
   }
   return CheckShape(hlo,
                     ShapeInference::InferAllToAllTupleShape(operand_shapes));
@@ -697,7 +777,8 @@ absl::Status ShapeVerifier::HandleRaggedAllToAll(HloInstruction* hlo) {
       return Internal("RaggedAllToAll operand %d must be rank 1 or 2: %s",
                       i - 1, hlo->ToString());
     }
-    if (!ShapeUtil::Equal(*operand_shapes[i - 1], *operand_shapes[i])) {
+    if (!Shape::Equal().IgnoreMemorySpaceInLayout()(*operand_shapes[i - 1],
+                                                    *operand_shapes[i])) {
       return Internal(
           "RaggedAllToAll operands have different shapes (%d, %d): %s", i - 1,
           i, hlo->ToString());
@@ -912,6 +993,23 @@ absl::Status ShapeVerifier::HandleCollectiveBroadcast(HloInstruction* hlo) {
       hlo, ShapeInference::InferCollectiveBroadcastShape(operand_shapes));
 }
 
+absl::Status ShapeVerifier::HandleCollectiveReduce(HloInstruction* hlo) {
+  auto* cr = Cast<HloCollectiveReduceInstruction>(hlo);
+  if (opts_.ShouldCheckReplicaGroups()) {
+    ABSL_ASSIGN_OR_RETURN(CollectiveOpGroupMode group_mode,
+                     GetCollectiveOpGroupMode(cr->channel_id().has_value(),
+                                              cr->use_global_device_ids()));
+    ABSL_RETURN_IF_ERROR(CheckReplicaGroups(cr, group_mode,
+                                       /*uniform_replica_group_size=*/false));
+  }
+  std::vector<const Shape*> operand_shapes;
+  for (const HloInstruction* operand : hlo->operands()) {
+    operand_shapes.push_back(&operand->shape());
+  }
+  return CheckShape(hlo, ShapeInference::InferCollectiveReduceShape(
+                             operand_shapes, cr->has_dynamic_root()));
+}
+
 absl::Status ShapeVerifier::HandleCollectivePermute(HloInstruction* hlo) {
   HloCollectivePermuteInstruction* collective_permute =
       Cast<HloCollectivePermuteInstruction>(hlo);
@@ -1111,6 +1209,14 @@ absl::Status ShapeVerifier::HandleReverse(HloInstruction* reverse) {
   return CheckShape(
       reverse, ShapeInference::InferReverseShape(reverse->operand(0)->shape(),
                                                  reverse->dimensions()));
+}
+
+absl::Status ShapeVerifier::HandleShuffle(HloInstruction* shuffle) {
+  HloShuffleInstruction* shuffle_instr = Cast<HloShuffleInstruction>(shuffle);
+  return CheckShape(
+      shuffle, ShapeInference::InferShuffleShape(
+                   shuffle_instr->operand(0)->shape(),
+                   shuffle_instr->dimensions(), shuffle_instr->shuffle_mode()));
 }
 
 absl::Status ShapeVerifier::HandleTopK(HloInstruction* hlo) {
@@ -1364,23 +1470,34 @@ absl::Status ShapeVerifier::HandleScan(HloInstruction* scan) {
   int64_t num_inputs = operand_shapes.size() - num_carries;
   int64_t num_outputs = result_shapes.size() - num_carries;
 
-  // Build the shape-equality predicate. Layouts are always ignored:
-  // associative scans are lowered directly by an emitter, so the to_apply
-  // computation is never materialized and its parameter layouts are
-  // independent of the operand array layouts (which are freely assigned by
-  // layout assignment). The layout-sensitive guard above ensures
-  // non-associative scans never reach this point.
+  // shapes_match always ignores layouts: associative scans are lowered
+  // directly by an emitter, so the to_apply computation is never materialized
+  // and its parameter layouts are independent of the operand array layouts
+  // (which are freely assigned by layout assignment). The layout-sensitive
+  // guard above ensures non-associative scans never reach this point.
   //
-  // When mixed precision is allowed, also ignore FP precision: during BF16
+  // When mixed precision is allowed, it also ignores FP precision: during BF16
   // propagation the scan I/O and the body parameter/root shapes can
   // transiently disagree on element type (e.g. body root pinned at F32 while
   // the scan output has been lowered to BF16). ResolveInconsistentScans
-  // reconciles these mismatches before the final, strict verifier pass.
-  // This mirrors HandleReduce / HandleReduceWindow / HandleMap.
-  auto shape_equal = Shape::Equal().IgnoreLayout();
-  if (opts_.allow_mixed_precision) {
-    shape_equal.IgnoreFpPrecision();
-  }
+  // reconciles these mismatches before the final, strict verifier pass. BF16
+  // conversion folding can also leave a BF16 init feeding an F32 carry. This
+  // mirrors HandleReduce / HandleReduceWindow / HandleMap.
+  //
+  // ShapesSame applies its predicate only when the verifier is layout
+  // sensitive. Otherwise it uses ShapeUtil::Compatible, which also compares
+  // element types, so the layout insensitive mixed precision case calls
+  // ShapeUtil::CompatibleIgnoringFpPrecision directly.
+  auto shapes_match = [&](const Shape& a, const Shape& b) {
+    if (!opts_.layout_sensitive && opts_.allow_mixed_precision) {
+      return ShapeUtil::CompatibleIgnoringFpPrecision(a, b);
+    }
+    auto shape_equal = Shape::Equal().IgnoreLayout();
+    if (opts_.allow_mixed_precision) {
+      shape_equal.IgnoreFpPrecision();
+    }
+    return ShapesSame(a, b, shape_equal);
+  };
 
   // Check shapes of operands vs to_apply parameters.
   for (int64_t i = 0; i < operand_shapes.size(); ++i) {
@@ -1398,7 +1515,7 @@ absl::Status ShapeVerifier::HandleScan(HloInstruction* scan) {
       }
       expected_param_shape.DeleteDimension(scan_dim);
     }
-    if (!ShapesSame(param_shape, expected_param_shape, shape_equal)) {
+    if (!shapes_match(param_shape, expected_param_shape)) {
       return Internal(
           "Shapes of operand %d and to_apply computation parameter are "
           "inconsistent",
@@ -1412,7 +1529,7 @@ absl::Status ShapeVerifier::HandleScan(HloInstruction* scan) {
   for (int64_t i = 0; i < num_carries; ++i) {
     const Shape& param_shape = parameter_shapes[i + num_inputs];
     const Shape& root_shape = root_shapes[i + num_outputs];
-    if (!ShapesSame(param_shape, root_shape, shape_equal)) {
+    if (!shapes_match(param_shape, root_shape)) {
       return Internal(
           "Shapes of parameter %d and root in to_apply computation are "
           "inconsistent",
@@ -1420,9 +1537,9 @@ absl::Status ShapeVerifier::HandleScan(HloInstruction* scan) {
     }
   }
 
-  // Check shapes of results vs to_apply root. Use the same shape_equal
-  // predicate as above so allow_mixed_precision lets the body root and the
-  // scan result transiently disagree on FP precision during propagation.
+  // Check shapes of results vs to_apply root. Use shapes_match as above so
+  // allow_mixed_precision lets the body root and the scan result transiently
+  // disagree on FP precision during propagation.
   for (int64_t i = 0; i < root_shapes.size(); ++i) {
     const Shape& root_shape = root_shapes[i];
     const Shape& result_shape = result_shapes[i];
@@ -1438,7 +1555,7 @@ absl::Status ShapeVerifier::HandleScan(HloInstruction* scan) {
       }
       expected_root_shape.DeleteDimension(scan_dim);
     }
-    if (!ShapesSame(root_shape, expected_root_shape, shape_equal)) {
+    if (!shapes_match(root_shape, expected_root_shape)) {
       return Internal(
           "Shapes of result %d and to_apply computation root are "
           "inconsistent",
@@ -1640,40 +1757,46 @@ absl::Status ShapeVerifier::HandleFusion(HloInstruction* fusion) {
   return absl::OkStatus();
 }
 
+absl::Status ShapeVerifier::CheckCompositeCall(const HloInstruction* call) {
+  if (!call->is_composite()) {
+    return absl::OkStatus();
+  }
+  TF_RET_CHECK(call->has_frontend_attributes())
+      << "A composite call op must have frontend attributes";
+  auto map = call->frontend_attributes().map();
+  if (auto name = map.find("composite.name");
+      name == map.end() || name->second.empty()) {
+    return InvalidArgument(
+        "A composite call op must have frontend attributes with key "
+        "composite.name whose value is non-empty");
+  }
+  if (auto attributes = map.find("composite.attributes");
+      attributes != map.end() && attributes->second.empty()) {
+    return InvalidArgument(
+        "A composite call op must have frontend attributes with key "
+        "composite.attributes whose value is default: {} or non-empty");
+  }
+  if (auto version_str = map.find("composite.version");
+      version_str != map.end()) {
+    int64_t version = 0;
+    if (!absl::SimpleAtoi(version_str->second, &version) || version < 0) {
+      return InvalidArgument(
+          "A composite call op must have frontend attributes with a "
+          "composite.version whose value is a non-negative integer but got: "
+          "%s",
+          version_str->second);
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ShapeVerifier::HandleCall(HloInstruction* call) {
   ABSL_RETURN_IF_ERROR(
       CheckParameterCount(call, call->to_apply(), call->operand_count()));
   for (int64_t i = 0; i < call->to_apply()->num_parameters(); ++i) {
     ABSL_RETURN_IF_ERROR(CheckOperandAndParameter(call, i, call->to_apply(), i));
   }
-  if (call->is_composite()) {
-    TF_RET_CHECK(call->has_frontend_attributes())
-        << "A composite call op must have frontend attributes";
-    auto map = call->frontend_attributes().map();
-    if (auto name = map.find("composite.name");
-        name == map.end() || name->second.empty()) {
-      return InvalidArgument(
-          "A composite call op must have frontend attributes with key "
-          "composite.name whose value is non-empty");
-    }
-    if (auto attributes = map.find("composite.attributes");
-        attributes != map.end() && attributes->second.empty()) {
-      return InvalidArgument(
-          "A composite call op must have frontend attributes with key "
-          "composite.attributes whose value is default: {} or non-empty");
-    }
-    if (auto version_str = map.find("composite.version");
-        version_str != map.end()) {
-      int64_t version = 0;
-      if (!absl::SimpleAtoi(version_str->second, &version) || version < 0) {
-        return InvalidArgument(
-            "A composite call op must have frontend attributes with a "
-            "composite.version whose value is a non-negative integer but got: "
-            "%s",
-            version_str->second);
-      }
-    }
-  }
+  ABSL_RETURN_IF_ERROR(CheckCompositeCall(call));
   // The shape of kCall should match the shape of the computation it calls.
   return CheckShape(call, call->to_apply()->root_instruction()->shape());
 }
@@ -1720,8 +1843,7 @@ absl::Status ShapeVerifier::HandleCustomCall(HloInstruction* instruction) {
     const Shape& operand_subshape = ShapeUtil::GetSubshape(
         custom_call->operand(pair.second.first)->shape(), pair.second.second);
     if (opts_.layout_sensitive) {
-      bool operand_is_scalar = operand_subshape.IsArray() &&
-                               ShapeUtil::ElementsIn(operand_subshape) == 1;
+      bool operand_is_scalar = ShapeUtil::IsEffectiveScalar(operand_subshape);
       auto shape_equal_checker = Shape::Equal().IgnoreBuffer(ignore_buffer);
       if (operand_is_scalar) {
         shape_equal_checker.IgnoreMemorySpaceInLayout();
@@ -1887,14 +2009,17 @@ absl::Status ShapeVerifier::HandlePad(HloInstruction* pad) {
 namespace {
 
 absl::Status CheckAsyncOpComputationThreadName(const HloInstruction* async_op) {
+  HloComputation* comp = async_op->async_wrapped_computation();
+  if (comp == nullptr) {
+    return absl::OkStatus();
+  }
   absl::string_view async_execution_thread = async_op->async_execution_thread();
-  if (async_execution_thread !=
-      async_op->async_wrapped_computation()->execution_thread()) {
+  if (async_execution_thread != comp->execution_thread()) {
     return Internal(
         "%s expects same async thread name as wrapped computation's "
         "thread name (%s vs %s).",
         HloOpcodeString(async_op->opcode()), async_execution_thread,
-        async_op->async_wrapped_computation()->execution_thread());
+        comp->execution_thread());
   }
   return absl::OkStatus();
 }
@@ -1919,11 +2044,21 @@ absl::Status CheckCallableInstructionThreadName(
 
 absl::Status ShapeVerifier::CheckAsyncOpAliasConfig(
     const HloInstruction* async_op) {
-  if (async_op->opcode() == HloOpcode::kAsyncUpdate ||
-      async_op->opcode() == HloOpcode::kAsyncDone) {
-    return absl::OkStatus();
+  switch (async_op->opcode()) {
+    case HloOpcode::kAsyncStart:
+      return CheckAsyncStartAliasConfig(async_op);
+    case HloOpcode::kAsyncUpdate:
+      return CheckAsyncUpdateAliasConfig(async_op);
+    case HloOpcode::kAsyncDone:
+      return absl::OkStatus();
+    default:
+      return Internal("Unexpected async opcode: %s",
+                      HloOpcodeString(async_op->opcode()));
   }
+}
 
+absl::Status ShapeVerifier::CheckAsyncStartAliasConfig(
+    const HloInstruction* async_op) {
   CHECK(async_op->opcode() == HloOpcode::kAsyncStart);
 
   const HloAsyncStartInstruction* async_start =
@@ -1964,6 +2099,55 @@ absl::Status ShapeVerifier::CheckAsyncOpAliasConfig(
     const Shape& operand_subshape = ShapeUtil::GetSubshape(
         async_computation->parameter_instruction(operand_number)->shape(),
         operand_index);
+    if (opts_.layout_sensitive) {
+      TF_RET_CHECK(
+          Shape::Equal().IgnoreBuffer()(operand_subshape, output_subshape))
+          << absl::Substitute("Different aliasing shapes: $0 vs $1",
+                              operand_subshape.ToString(/*print_layout=*/true),
+                              output_subshape.ToString(/*print_layout=*/true));
+    } else {
+      TF_RET_CHECK(
+          Shape::Equal().IgnoreDynamicDimension().IgnoreLayout().IgnoreBuffer()(
+              output_subshape, operand_subshape))
+          << absl::Substitute("Different aliasing shapes: $0 vs $1",
+                              operand_subshape.ToString(/*print_layout=*/true),
+                              output_subshape.ToString(/*print_layout=*/true));
+    }
+  }
+
+  return absl::OkStatus();
+}
+
+// Checks that the aliasing config of the given async instruction is valid.
+absl::Status ShapeVerifier::CheckAsyncUpdateAliasConfig(
+    const HloInstruction* async_op) {
+  CHECK(async_op->opcode() == HloOpcode::kAsyncUpdate);
+  const auto* async_update = Cast<HloAsyncUpdateInstruction>(async_op);
+  const HloInstruction* predecessor = async_update->operand(0);
+
+  for (const auto& [output_index, operand_info] :
+       async_update->output_to_operand_aliasing()) {
+    const auto& [operand_number, operand_index] = operand_info;
+
+    TF_RET_CHECK(operand_number == 0)
+        << "Invalid operand number in async-update aliasing config, can only "
+           "alias to operand 0 (previous async op).";
+    TF_RET_CHECK(!operand_index.empty() && operand_index.front() == 2 &&
+                 ShapeUtil::IndexIsValid(predecessor->shape(), operand_index))
+        << "Invalid operand shape index in async-update aliasing config, can "
+           "only alias context of previous async op.";
+    TF_RET_CHECK(!output_index.empty() && output_index.front() == 2)
+        << "Invalid output shape index in async-update aliasing config, can "
+           "only alias to context.";
+
+    TF_RET_CHECK(ShapeUtil::IndexIsValid(predecessor->shape(), operand_index))
+        << "Out of bounds operand index in async-update aliasing config.";
+    const Shape& operand_subshape =
+        ShapeUtil::GetSubshape(predecessor->shape(), operand_index);
+    TF_RET_CHECK(ShapeUtil::IndexIsValid(async_update->shape(), output_index))
+        << "Out of bounds output index in async-update aliasing config.";
+    const Shape& output_subshape =
+        ShapeUtil::GetSubshape(async_update->shape(), output_index);
     if (opts_.layout_sensitive) {
       TF_RET_CHECK(
           Shape::Equal().IgnoreBuffer()(operand_subshape, output_subshape))
@@ -2057,15 +2241,39 @@ absl::Status ShapeVerifier::CheckAsyncUpdateOperands(
                     async_update->operand_count());
   }
   const HloInstruction* operand0 = async_update->operand(0);
-
-  if (operand0->opcode() != HloOpcode::kAsyncStart &&
-      operand0->opcode() != HloOpcode::kAsyncUpdate) {
+  const HloInstruction* async_producer =
+      hlo_instruction_utils::async::FindAsyncProducer(operand0);
+  if (async_producer == nullptr ||
+      (async_producer->opcode() != HloOpcode::kAsyncStart &&
+       async_producer->opcode() != HloOpcode::kAsyncUpdate)) {
     return Internal(
-        "%s (opcode: %s) expects the operand to be async-start or "
-        "async-update, "
-        "found %s.",
+        "%s (opcode: %s) expects operand to trace to async-start or "
+        "async-update, found "
+        "%s.",
         async_update->name(), HloOpcodeString(async_update->opcode()),
-        HloOpcodeString(operand0->opcode()));
+        async_producer != nullptr ? HloOpcodeString(async_producer->opcode())
+                                  : HloOpcodeString(operand0->opcode()));
+  }
+  HloComputation* op_comp = async_update->async_wrapped_computation();
+  HloComputation* prod_comp = async_producer->async_wrapped_computation();
+  if (op_comp == nullptr || prod_comp == nullptr || *op_comp != *prod_comp) {
+    return Internal(
+        "The %s expects its wrapped async computation to be identical to its "
+        "operand's wrapped async computation (%s vs %s), thread name (%s vs "
+        "%s).",
+        HloOpcodeString(async_update->opcode()),
+        async_update->async_wrapped_instruction() != nullptr
+            ? async_update->async_wrapped_instruction()->ToString()
+            : "null",
+        async_producer->async_wrapped_instruction() != nullptr
+            ? async_producer->async_wrapped_instruction()->ToString()
+            : "null",
+        async_update->async_wrapped_computation() != nullptr
+            ? async_update->async_wrapped_computation()->execution_thread()
+            : "null",
+        async_producer->async_wrapped_computation() != nullptr
+            ? async_producer->async_wrapped_computation()->execution_thread()
+            : "null");
   }
 
   const Shape& shape0 = operand0->shape();
@@ -2130,18 +2338,43 @@ absl::Status ShapeVerifier::CheckAsyncDoneOperands(
   }
 
   const HloInstruction* operand0 = async_done->operand(0);
-  if (operand0->opcode() != HloOpcode::kAsyncStart &&
-      operand0->opcode() != HloOpcode::kAsyncUpdate) {
+  const HloInstruction* async_producer =
+      hlo_instruction_utils::async::FindAsyncProducer(operand0);
+  if (async_producer == nullptr ||
+      (async_producer->opcode() != HloOpcode::kAsyncStart &&
+       async_producer->opcode() != HloOpcode::kAsyncUpdate)) {
     return Internal(
-        "%s (opcode: %s) expects the operand to be async-start or "
-        "async-update, "
-        "found %s.",
+        "%s (opcode: %s) expects operand to trace to async-start or "
+        "async-update, found "
+        "%s.",
         async_done->name(), HloOpcodeString(async_done->opcode()),
-        HloOpcodeString(operand0->opcode()));
+        async_producer != nullptr ? HloOpcodeString(async_producer->opcode())
+                                  : HloOpcodeString(operand0->opcode()));
+  }
+  HloComputation* op_comp = async_done->async_wrapped_computation();
+  HloComputation* prod_comp = async_producer->async_wrapped_computation();
+  if (op_comp == nullptr || prod_comp == nullptr || *op_comp != *prod_comp) {
+    return Internal(
+        "The %s expects its wrapped async computation to be identical to its "
+        "operand's wrapped async computation (%s vs %s), thread name (%s vs "
+        "%s).",
+        HloOpcodeString(async_done->opcode()),
+        async_done->async_wrapped_instruction() != nullptr
+            ? async_done->async_wrapped_instruction()->ToString()
+            : "null",
+        async_producer->async_wrapped_instruction() != nullptr
+            ? async_producer->async_wrapped_instruction()->ToString()
+            : "null",
+        async_done->async_wrapped_computation() != nullptr
+            ? async_done->async_wrapped_computation()->execution_thread()
+            : "null",
+        async_producer->async_wrapped_computation() != nullptr
+            ? async_producer->async_wrapped_computation()->execution_thread()
+            : "null");
   }
 
-  if (!hlo_instruction_utils::async::AreOperandsAndOutputFullyBound(operand0,
-                                                                    {0})
+  if (!hlo_instruction_utils::async::AreOperandsAndOutputFullyBound(
+           async_producer, {0})
            .value_or(false)) {
     return Internal(
         "%s (opcode: %s) expects the operands of the previous async "
@@ -2158,10 +2391,14 @@ absl::Status ShapeVerifier::CheckAsyncOpComputationShapes(
   CHECK(async_op->opcode() == HloOpcode::kAsyncStart ||
         async_op->opcode() == HloOpcode::kAsyncUpdate ||
         async_op->opcode() == HloOpcode::kAsyncDone);
+  const HloComputation* async_computation =
+      async_op->async_wrapped_computation();
+  if (async_computation == nullptr) {
+    return absl::OkStatus();
+  }
   const Shape* async_shape = &async_op->shape();
 
-  ProgramShape computation_shape =
-      async_op->async_wrapped_computation()->ComputeProgramShape();
+  ProgramShape computation_shape = async_computation->ComputeProgramShape();
   Shape param_shape = ShapeUtil::MakeTupleShape(computation_shape.parameters());
   if (async_op->opcode() == HloOpcode::kAsyncStart ||
       async_op->opcode() == HloOpcode::kAsyncUpdate) {
@@ -2817,8 +3054,7 @@ absl::Status VerifySingleUser(
   // Ignore "control_dep" custom calls.
   std::vector<const HloInstruction*> real_users;
   for (const HloInstruction* user : instruction->users()) {
-    if (user->opcode() == HloOpcode::kCustomCall &&
-        user->custom_call_target() == "control_dep") {
+    if (user->IsCustomCall("control_dep")) {
       continue;
     }
     real_users.push_back(user);
@@ -2829,7 +3065,8 @@ absl::Status VerifySingleUser(
       << " instruction requires one consumer, found " << real_users.size();
 
   const HloInstruction* user = real_users.front();
-  TF_RET_CHECK(expected_users.contains(user->opcode()))
+  TF_RET_CHECK(expected_users.contains(user->opcode()) ||
+               user->IsAllowedAsyncIntermediary())
       << "The consumer of a " << instruction->opcode()
       << " instruction needs to be one of ("
       << absl::StrJoin(expected_users, ", ",
@@ -2849,61 +3086,97 @@ absl::Status VerifySingleOperand(
       << instruction->operand_count();
 
   const HloInstruction* operand = instruction->operand(0);
-  TF_RET_CHECK(absl::c_find(expected_operands, operand->opcode()) !=
-               expected_operands.end())
-      << "The operand of a " << instruction->opcode()
-      << " instruction needs to be "
-      << absl::StrJoin(expected_operands, " or ",
-                       [](std::string* out, HloOpcode opcode) {
-                         absl::StrAppend(out, HloOpcodeString(opcode));
-                       })
-      << ", found " << operand->opcode();
+  const HloInstruction* producer =
+      hlo_instruction_utils::async::FindAsyncProducer(operand);
+  bool matches = absl::c_linear_search(expected_operands, operand->opcode()) ||
+                 (producer != nullptr &&
+                  absl::c_linear_search(expected_operands, producer->opcode()));
+  TF_RET_CHECK(matches) << "The operand of a " << instruction->opcode()
+                        << " instruction needs to be "
+                        << absl::StrJoin(
+                               expected_operands, " or ",
+                               [](std::string* out, HloOpcode opcode) {
+                                 absl::StrAppend(out, HloOpcodeString(opcode));
+                               })
+                        << ", found " << operand->opcode();
   return absl::OkStatus();
+}
+
+bool IsCarriedAcrossWhileLoop(const HloInstruction* async_op) {
+  absl::flat_hash_set<const HloInstruction*> visited;
+  std::vector<const HloInstruction*> worklist = {async_op};
+  while (!worklist.empty()) {
+    const HloInstruction* instr = worklist.back();
+    worklist.pop_back();
+    if (instr == nullptr || !visited.insert(instr).second) {
+      continue;
+    }
+    const HloComputation* comp = instr->parent();
+    if (comp != nullptr && instr == comp->root_instruction()) {
+      for (const HloInstruction* caller : comp->caller_instructions()) {
+        if (caller->opcode() == HloOpcode::kWhile &&
+            caller->while_body() == comp) {
+          return true;
+        }
+        if (caller->opcode() == HloOpcode::kCall ||
+            caller->opcode() == HloOpcode::kConditional) {
+          worklist.push_back(caller);
+        }
+      }
+    }
+    for (const HloInstruction* user : instr->users()) {
+      if (user->opcode() == HloOpcode::kWhile) {
+        return true;
+      }
+      if (user->opcode() == HloOpcode::kAsyncUpdate ||
+          user->opcode() == HloOpcode::kTuple ||
+          user->opcode() == HloOpcode::kGetTupleElement ||
+          user->opcode() == HloOpcode::kOptimizationBarrier ||
+          user->opcode() == HloOpcode::kDomain ||
+          user->opcode() == HloOpcode::kCall ||
+          user->opcode() == HloOpcode::kConditional) {
+        worklist.push_back(user);
+      }
+    }
+  }
+  return false;
 }
 
 // Checks asynchronous instruction pairs.
 absl::Status VerifyAsynchronousInstructionPairs(const HloModule& module) {
-  // CopyStart must have a single CopyDone user.
-
   for (const HloComputation* computation : module.computations()) {
     for (const HloInstruction* instruction : computation->instructions()) {
       for (int i = 0; i < instruction->operand_count(); ++i) {
         const HloInstruction* operand = instruction->operand(i);
         if (operand->opcode() == HloOpcode::kAsyncStart ||
             operand->opcode() == HloOpcode::kAsyncUpdate) {
-          if (i != 0 || (instruction->opcode() != HloOpcode::kAsyncUpdate &&
-                         instruction->opcode() != HloOpcode::kAsyncDone)) {
+          if (instruction->opcode() == HloOpcode::kAsyncUpdate ||
+              instruction->opcode() == HloOpcode::kAsyncDone) {
+            if (i != 0) {
+              return Internal(
+                  "Async instruction %s used as operand %d of %s. "
+                  "Async instructions can only be used as the first operand of "
+                  "async-update or async-done.",
+                  operand->name(), i, instruction->name());
+            }
+          } else if (instruction->opcode() != HloOpcode::kTuple &&
+                     instruction->opcode() != HloOpcode::kGetTupleElement &&
+                     instruction->opcode() != HloOpcode::kWhile &&
+                     instruction->opcode() != HloOpcode::kCall &&
+                     instruction->opcode() != HloOpcode::kConditional &&
+                     instruction->opcode() != HloOpcode::kOptimizationBarrier &&
+                     instruction->opcode() != HloOpcode::kDomain &&
+                     !instruction->IsAllowedAsyncIntermediary()) {
             return Internal(
                 "Async instruction %s used as operand %d of %s. "
-                "Async instructions can only be used as the first operand of "
-                "async-update or async-done.",
+                "Async instructions can only be used as operands of "
+                "async-update, async-done, control flow, or tuple "
+                "instructions.",
                 operand->name(), i, instruction->name());
           }
         }
       }
       switch (instruction->opcode()) {
-        case HloOpcode::kAsyncStart: {
-          ABSL_RETURN_IF_ERROR(VerifySingleUser(
-              instruction, {HloOpcode::kAsyncUpdate, HloOpcode::kAsyncDone}));
-          break;
-        }
-        case HloOpcode::kAsyncUpdate: {
-          TF_RET_CHECK(!instruction->operands().empty());
-          const HloInstruction* operand = instruction->operand(0);
-          TF_RET_CHECK(operand->opcode() == HloOpcode::kAsyncStart ||
-                       operand->opcode() == HloOpcode::kAsyncUpdate)
-              << "The first operand of a " << instruction->opcode()
-              << " instruction needs to be AsyncStart or AsyncUpdate, found "
-              << operand->opcode();
-          ABSL_RETURN_IF_ERROR(VerifySingleUser(
-              instruction, {HloOpcode::kAsyncUpdate, HloOpcode::kAsyncDone}));
-          break;
-        }
-        case HloOpcode::kAsyncDone: {
-          ABSL_RETURN_IF_ERROR(VerifySingleOperand(
-              instruction, {HloOpcode::kAsyncStart, HloOpcode::kAsyncUpdate}));
-          break;
-        }
         case HloOpcode::kAllReduceStart: {
           ABSL_RETURN_IF_ERROR(
               VerifySingleUser(instruction, {HloOpcode::kAllReduceDone}));
@@ -2981,6 +3254,86 @@ absl::Status VerifyAsynchronousInstructionPairs(const HloModule& module) {
       }
     }
   }
+
+  // Verify pairing of asynchronous instructions.
+  std::vector<const HloInstruction*> async_starts;
+  std::vector<const HloInstruction*> async_updates;
+  std::vector<const HloInstruction*> async_dones;
+
+  for (const HloComputation* computation : module.computations()) {
+    for (const HloInstruction* instruction : computation->instructions()) {
+      if (instruction->opcode() == HloOpcode::kAsyncStart) {
+        async_starts.push_back(instruction);
+      } else if (instruction->opcode() == HloOpcode::kAsyncUpdate) {
+        async_updates.push_back(instruction);
+      } else if (instruction->opcode() == HloOpcode::kAsyncDone) {
+        async_dones.push_back(instruction);
+      }
+    }
+  }
+
+  absl::flat_hash_map<const HloInstruction*, const HloInstruction*>
+      start_to_done;
+  absl::flat_hash_set<const HloInstruction*> visited_updates;
+
+  for (const HloInstruction* async_done : async_dones) {
+    if (async_done->operand_count() != 1) {
+      return Internal("async-done %s must have exactly one operand",
+                      async_done->name());
+    }
+    const HloInstruction* current = async_done;
+    const HloInstruction* producer =
+        hlo_instruction_utils::async::FindAsyncProducer(current->operand(0));
+
+    while (producer != nullptr &&
+           producer->opcode() == HloOpcode::kAsyncUpdate) {
+      if (producer->operand_count() < 1) {
+        return Internal("async-update %s must have at least one operand",
+                        producer->name());
+      }
+      if (!visited_updates.insert(producer).second) {
+        return Internal("Async update %s is part of multiple chains or a cycle",
+                        producer->name());
+      }
+      current = producer;
+      producer =
+          hlo_instruction_utils::async::FindAsyncProducer(current->operand(0));
+    }
+
+    if (producer == nullptr) {
+      return Internal("Async done %s does not trace back to an async start",
+                      async_done->name());
+    }
+
+    if (producer->opcode() != HloOpcode::kAsyncStart) {
+      return Internal("Async done %s traces back to non-start async op %s",
+                      async_done->name(), producer->name());
+    }
+
+    auto [it, inserted] = start_to_done.emplace(producer, async_done);
+    if (!inserted) {
+      return Internal(
+          "Async start %s is matched by multiple async done instructions: %s "
+          "and %s",
+          producer->name(), it->second->name(), async_done->name());
+    }
+  }
+
+  for (const HloInstruction* async_start : async_starts) {
+    if (!start_to_done.contains(async_start) &&
+        !IsCarriedAcrossWhileLoop(async_start)) {
+      return Internal("Async start %s has no matching async done",
+                      async_start->name());
+    }
+  }
+
+  for (const HloInstruction* async_update : async_updates) {
+    if (!visited_updates.contains(async_update) &&
+        !IsCarriedAcrossWhileLoop(async_update)) {
+      return Internal("Orphan async update %s found", async_update->name());
+    }
+  }
+
   return absl::OkStatus();
 }
 
@@ -3367,12 +3720,12 @@ std::string FormatShapeIndexValidationError(
   }
   return absl::StrFormat(
       "Mismatched tuple structure in shape and original value.\n%s"
-      "Instruction: %s\nShape indices in shape only: {%s}\nShape indices in "
-      "original value "
-      "only: {%s}",
-      module_info, instruction->ToString(),
-      absl::StrJoin(shape_only, ", ", shape_index_formatter),
-      absl::StrJoin(ov_only, ", ", shape_index_formatter));
+      "Shape indices in shape only: {%s}\nShape indices in "
+      "original value only: {%s}\n"
+      "Instruction: %s\n",
+      module_info, absl::StrJoin(shape_only, ", ", shape_index_formatter),
+      absl::StrJoin(ov_only, ", ", shape_index_formatter),
+      instruction->ToString());
 }
 
 }  // namespace
@@ -3632,28 +3985,18 @@ absl::Status CheckElementwiseInstruction(HloInstruction* instruction) {
   }
 
   if (auto* comparison = DynCast<HloCompareInstruction>(instruction)) {
-    const Shape& operand_shape = comparison->operand(1)->shape();
+    const Shape& operand_shape = comparison->operand(0)->shape();
     PrimitiveType operand_element_type = operand_shape.element_type();
-    Comparison::Type default_comparison_type =
-        Comparison::DefaultComparisonType(operand_element_type);
-    if (primitive_util::IsFloatingPointType(operand_element_type)) {
-      if (comparison->type() != Comparison::Type::kFloat &&
-          comparison->type() != Comparison::Type::kFloatTotalOrder) {
+    if (primitive_util::IsIntegralType(operand_element_type) ||
+        operand_element_type == PRED) {
+      if (comparison->order() != ComparisonOrder::kTotal) {
         return FailedPrecondition(
-            "Expected comparison type %s or %s.\n"
-            "actual: %s\noperand: %s\n",
-            ComparisonTypeToString(Comparison::Type::kFloat),
-            ComparisonTypeToString(Comparison::Type::kFloatTotalOrder),
-            ComparisonTypeToString(comparison->type()),
+            "Expected comparison order %s for integral/pred operand, but got "
+            "%s.\noperand: %s\n",
+            ComparisonOrderToShortString(ComparisonOrder::kTotal),
+            ComparisonOrderToShortString(comparison->order()),
             ShapeUtil::HumanString(operand_shape));
       }
-    } else if (comparison->type() != default_comparison_type) {
-      return FailedPrecondition(
-          "Expected comparison type %s.\n"
-          "actual: %s\noperand: %s\n",
-          ComparisonTypeToString(default_comparison_type),
-          ComparisonTypeToString(comparison->type()),
-          ShapeUtil::HumanString(operand_shape));
     }
   }
   return absl::OkStatus();
@@ -3734,7 +4077,7 @@ int64_t CountWritersInUser(const HloInstruction* inst,
   return 0;
 }
 
-// Returns the number of writers for the value produced by the instruction in
+// Returns the number of writers for the HloValue produced by the instruction in
 // the given shape_index. This is to support the verification that a buffer can
 // have at most one writer and we may return early when we find more than one
 // writers, but we choose not to return early.
@@ -3748,8 +4091,8 @@ int64_t CountWriters(const HloInstruction* inst,
   return num_writers;
 }
 
-// Verifies a buffer result produced by the given instruction can have at most
-// one writer.
+// Verifies a buffer result (i.e. HloValue) produced by the given instruction
+// can have at most one writer.
 absl::Status CheckBufferHasUniqueWriter(const HloInstruction* inst,
                                         const ShapeIndex& result_index) {
   if (CountWriters(inst, result_index) > 1) {
@@ -3761,8 +4104,8 @@ absl::Status CheckBufferHasUniqueWriter(const HloInstruction* inst,
   return absl::OkStatus();
 }
 
-// Verifies all buffer results produced by the given instruction can have at
-// most one writer.
+// Verifies all buffer results (i.e. HloValues) produced by the given
+// instruction can have at most one writer.
 absl::Status CheckBufferHasUniqueWriters(const HloInstruction* inst) {
   return ShapeUtil::ForEachSubshapeWithStatus(
       inst->shape(),
@@ -3836,6 +4179,122 @@ absl::Status VerifyUnpin(const HloCustomCallInstruction* inst,
   }
 
   return absl::OkStatus();
+}
+
+std::string FormatOutputToOperandAliasing(
+    const HloCustomCallInstruction* inst) {
+  return absl::StrCat("{",
+                      absl::StrJoin(inst->output_to_operand_aliasing(), ", ",
+                                    [](std::string* out, const auto& pair) {
+                                      absl::StrAppend(
+                                          out, pair.first.ToString(), ": (",
+                                          pair.second.first, ", ",
+                                          pair.second.second.ToString(), ")");
+                                    }),
+                      "}");
+}
+
+// Verifies the structural invariants of a FanOut custom call:
+// 1. Exactly 1 operand of buffer type.
+// 2. Result is a tuple with >= 2 buffer elements (element 0 is the anchor
+//    buffer, elements 1..N are concurrent stream view buffers).
+// 3. All tuple elements match the operand buffer shape.
+// 4. Output to operand aliasing strictly aliases element 0 to operand 0:
+//    {{0}: (0, {})}.
+// 5. Each tuple element buffer has at most one writer.
+absl::Status VerifyFanOut(const HloCustomCallInstruction* inst,
+                          bool layout_sensitive) {
+  if (inst->operand_count() != 1 || !inst->operand(0)->shape().IsBuffer()) {
+    return InvalidArgument(
+        "custom-call to FanOut must have one buffer operand");
+  }
+
+  if (!inst->shape().IsTuple() || inst->shape().tuple_shapes_size() < 2) {
+    return InvalidArgument(
+        "custom-call to FanOut must have a tuple result with >= 2 elements");
+  }
+
+  for (const auto& subshape : inst->shape().tuple_shapes()) {
+    if (!subshape.IsBuffer()) {
+      return InvalidArgument(
+          "custom-call to FanOut must only have buffer results in its tuple");
+    }
+    if (!xla::Shape::Equal()
+             .IgnoreLayout(!layout_sensitive)
+             .IgnoreMemorySpaceInLayout()(
+                 inst->operand(0)->shape().buffer_shape(),
+                 subshape.buffer_shape())) {
+      return InvalidArgument(
+          "custom-call to FanOut must have the same shape as the operand");
+    }
+  }
+
+  if (inst->output_to_operand_aliasing().size() != 1 ||
+      inst->output_to_operand_aliasing()[0].first != ShapeIndex({0}) ||
+      inst->output_to_operand_aliasing()[0].second !=
+          std::make_pair(int64_t{0}, ShapeIndex({}))) {
+    return InvalidArgument(
+        "custom-call to FanOut must only have output-to-operand aliasing for "
+        "output 0: {{0}: (0, {})}; got %s",
+        FormatOutputToOperandAliasing(inst));
+  }
+
+  for (int64_t i = 0; i < inst->shape().tuple_shapes_size(); ++i) {
+    ABSL_RETURN_IF_ERROR(CheckBufferHasUniqueWriter(inst, {i}));
+  }
+
+  return absl::OkStatus();
+}
+
+// Verifies the structural invariants of a FanIn custom call:
+// 1. At least 2 distinct operands, all of buffer type (operand 0 is the anchor
+//    buffer, operands 1..N are stream buffers to merge).
+// 2. Result is a single buffer matching the shape of all operands.
+// 3. Output to operand aliasing strictly aliases the result to operand 0:
+//    {{}: (0, {})}.
+// 4. Result buffer has at most one writer.
+absl::Status VerifyFanIn(const HloCustomCallInstruction* inst,
+                         bool layout_sensitive) {
+  if (inst->operand_count() < 2) {
+    return InvalidArgument(
+        "custom-call to FanIn must have at least 2 buffer operands");
+  }
+
+  if (!inst->shape().IsBuffer()) {
+    return InvalidArgument("custom-call to FanIn must have one buffer result");
+  }
+
+  absl::flat_hash_set<const HloInstruction*> seen_operands;
+  for (const auto* operand : inst->operands()) {
+    if (!operand->shape().IsBuffer()) {
+      return InvalidArgument(
+          "custom-call to FanIn must only have buffer operands");
+    }
+    if (!seen_operands.insert(operand).second) {
+      return InvalidArgument(
+          "custom-call to FanIn must have distinct operands");
+    }
+    if (!xla::Shape::Equal()
+             .IgnoreLayout(!layout_sensitive)
+             .IgnoreMemorySpaceInLayout()(operand->shape().buffer_shape(),
+                                          inst->shape().buffer_shape())) {
+      return InvalidArgument(
+          "custom-call to FanIn result must have the same shape as all "
+          "operands");
+    }
+  }
+
+  if (inst->output_to_operand_aliasing().size() != 1 ||
+      inst->output_to_operand_aliasing()[0].first != ShapeIndex({}) ||
+      inst->output_to_operand_aliasing()[0].second !=
+          std::make_pair(int64_t{0}, ShapeIndex({}))) {
+    return InvalidArgument(
+        "custom-call to FanIn must only have output-to-operand aliasing for "
+        "result: {{}: (0, {})}; got %s",
+        FormatOutputToOperandAliasing(inst));
+  }
+
+  return CheckBufferHasUniqueWriter(inst, {});
 }
 
 absl::Status VerifyNoBuffers(const Shape& shape, const HloInstruction* inst) {
@@ -3958,6 +4417,12 @@ absl::Status VerifyCustomCall(const HloCustomCallInstruction* inst,
   }
   if (inst->IsCustomCall(kUnpinCustomCallTarget)) {
     return VerifyUnpin(Cast<HloCustomCallInstruction>(inst), layout_sensitive);
+  }
+  if (inst->IsCustomCall(kFanOutCustomCallTarget)) {
+    return VerifyFanOut(inst, layout_sensitive);
+  }
+  if (inst->IsCustomCall(kFanInCustomCallTarget)) {
+    return VerifyFanIn(inst, layout_sensitive);
   }
 
   ABSL_RETURN_IF_ERROR(VerifyBuffersInOperands(inst));
@@ -4110,17 +4575,35 @@ absl::Status InstructionVerifier::HandleWhile(HloInstruction* xla_while) {
 
 absl::Status InstructionVerifier::HandleCall(HloInstruction* call) {
   if (opts_.verify_call_nested_computation_thread_name) {
-    return CheckCallableInstructionThreadName(call);
+    ABSL_RETURN_IF_ERROR(CheckCallableInstructionThreadName(call));
   }
-
-  // As opposed to other callable instructions, nothing respects input/output
-  // aliasing for call instructions, so make sure it's not set.
-  const HloCallableInstruction* callable =
-      DynCast<const HloCallableInstruction>(call);
-  TF_RET_CHECK(callable != nullptr);
-  TF_RET_CHECK(callable->output_to_operand_aliasing().empty())
-      << "Call instruction " << call->ToString()
-      << " may not have an output-to-operand aliasing set.";
+  const auto* callable = Cast<const HloCallableInstruction>(call);
+  for (const auto& pair : callable->output_to_operand_aliasing()) {
+    TF_RET_CHECK(pair.second.first < callable->operand_count())
+        << "Invalid aliasing operand index.";
+    TF_RET_CHECK(ShapeUtil::IndexIsValid(
+        callable->operand(pair.second.first)->shape(), pair.second.second))
+        << "Invalid aliasing operand shape index.";
+    TF_RET_CHECK(ShapeUtil::IndexIsValid(callable->shape(), pair.first))
+        << "Invalid aliasing output shape index.";
+    const Shape& output_subshape =
+        ShapeUtil::GetSubshape(callable->shape(), pair.first);
+    const Shape& operand_subshape = ShapeUtil::GetSubshape(
+        callable->operand(pair.second.first)->shape(), pair.second.second);
+    if (opts_.layout_sensitive) {
+      TF_RET_CHECK(Shape::Equal().IgnoreDynamicDimension()(operand_subshape,
+                                                           output_subshape))
+          << "Different aliasing shapes: "
+          << operand_subshape.ToString(/*print_layout=*/true) << " vs "
+          << output_subshape.ToString(/*print_layout=*/true);
+    } else {
+      TF_RET_CHECK(Shape::Equal().IgnoreDynamicDimension().IgnoreLayout()(
+          operand_subshape, output_subshape))
+          << "Different aliasing shapes: "
+          << operand_subshape.ToString(/*print_layout=*/false) << " vs "
+          << output_subshape.ToString(/*print_layout=*/false);
+    }
+  }
   return absl::OkStatus();
 }
 
@@ -4406,7 +4889,14 @@ absl::StatusOr<bool> HloVerifier::RunImpl(
         target_metadata_->GetVerifier();
     InstructionVerifier instruction_verifier(
         module, target_metadata_->GetVerifierOpts());
+    absl::flat_hash_map<absl::string_view, const HloComputation*>
+        computations_by_name;
     for (auto* computation : module->computations(execution_threads)) {
+      auto [it, inserted] =
+          computations_by_name.emplace(computation->name(), computation);
+      TF_RET_CHECK(inserted)
+          << "Computation has name that is not unique within module: "
+          << computation->name();
       ABSL_RETURN_IF_ERROR(computation->Accept(shape_verifier.get()));
       ABSL_RETURN_IF_ERROR(computation->Accept(&instruction_verifier));
       // Verify that async computations contain a single instruction unless
@@ -4438,6 +4928,9 @@ absl::StatusOr<bool> HloVerifier::RunImpl(
             execution_threads)) {
       ABSL_RETURN_IF_ERROR(module->input_output_alias_config().Verify(
           *module, [this](const Shape& shape) -> int64_t {
+            if (shape.is_unbounded_dynamic()) {
+              return Shape::kUnboundedSize;
+            }
             if (target_metadata_->GetVerifierOpts().IsLayoutSensitive()) {
               return target_metadata_->GetVerifierOpts().ShapeSize(shape);
             }

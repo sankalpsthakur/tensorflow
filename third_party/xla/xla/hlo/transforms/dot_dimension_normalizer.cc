@@ -22,15 +22,16 @@ limitations under the License.
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/analysis/shape_tracker.h"
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/permutation_util.h"
 #include "xla/service/matmul_indexing_utils.h"
 #include "xla/shape.h"
 #include "xla/util.h"
@@ -86,6 +87,29 @@ absl::StatusOr<HloInstruction*> NormalizeOperand(
   return tracker.ToInstructionChain(head);
 }
 
+// Reorders the lhs-rhs pairs of contracting dimensions so that collapsing them
+// needs a reshape rather than a transpose: sorts by lhs index, or by rhs index
+// if only the rhs dimensions become consecutive. Keeps the order if either side
+// is already consecutive.
+void SortContractingDimensionPairs(DotOperandDims* lhs, DotOperandDims* rhs) {
+  constexpr auto kContracting = DotOperandDims::kContracting;
+  if (lhs->IsConsecutive(kContracting) || rhs->IsConsecutive(kContracting)) {
+    return;
+  }
+  const bool by_rhs =
+      !DistinctNumbersAreConsecutiveIfSorted(lhs->Indices(kContracting)) &&
+      DistinctNumbersAreConsecutiveIfSorted(rhs->Indices(kContracting));
+  absl::Span<const int64_t> key = (by_rhs ? rhs : lhs)->Indices(kContracting);
+  std::vector<int64_t> order(key.size());
+  absl::c_iota(order, 0);
+  absl::c_sort(order, [&](int64_t a, int64_t b) { return key[a] < key[b]; });
+  for (DotOperandDims* dims : {lhs, rhs}) {
+    *dims = DotOperandDims(dims->shape(), dims->Indices(DotOperandDims::kBatch),
+                           dims->Indices(DotOperandDims::kNonContracting),
+                           Permute(dims->Indices(kContracting), order));
+  }
+}
+
 class NormalizerVisitor : public DfsHloRewriteVisitor {
  public:
   explicit NormalizerVisitor(bool normalize_noncontracting_dimensions)
@@ -110,6 +134,7 @@ class NormalizerVisitor : public DfsHloRewriteVisitor {
         !non_contracting_normalization_needed) {
       return absl::OkStatus();
     }
+    SortContractingDimensionPairs(&lhs_dims, &rhs_dims);
 
     ABSL_ASSIGN_OR_RETURN(HloInstruction * normalized_lhs,
                      NormalizeOperand(&lhs_dims, dot->mutable_operand(0),

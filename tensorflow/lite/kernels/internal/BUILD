@@ -259,6 +259,17 @@ cc_library(
     ],
 )
 
+cc_test(
+    name = "im2col_utils_test",
+    size = "small",
+    srcs = ["optimized/im2col_utils_test.cc"],
+    deps = [
+        ":optimized_base",
+        ":types",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "legacy_optimized_base",
     srcs = [],
@@ -745,6 +756,7 @@ cc_library(
         "//tensorflow/lite/core/c:common",
         "//tensorflow/lite/kernels:op_macros",
         "//tensorflow/lite/kernels/internal/utils:sparsity_format_converter",
+        "@com_google_absl//absl/types:span",
         "@eigen_archive//:eigen3",
         "@gemmlowp",
         "@ruy//ruy/profiler:instrumentation",
@@ -979,6 +991,7 @@ cc_library(
     compatible_with = get_compatible_with_portable(),
     copts = tflite_copts() + NEON_FLAGS_IF_APPLICABLE,
     deps = [
+        ":compatibility",
         ":cpu_check",
         "//tensorflow/lite/core/c:common",
     ] + selects.with_or({
@@ -1013,6 +1026,7 @@ cc_library(
     compatible_with = get_compatible_with_portable(),
     copts = tflite_copts() + NEON_FLAGS_IF_APPLICABLE,
     deps = [
+        ":compatibility",
         ":cpu_check",
         ":tensor_utils_no_eigen",
         "//tensorflow/lite/core/c:common",
@@ -1087,12 +1101,10 @@ cc_test(
     name = "depthwiseconv_quantized_test",
     srcs = [
         "depthwiseconv_quantized_test.cc",
-        "optimized/depthwiseconv_uint8_transitional.h",
     ],
     copts = tflite_copts(),
     shard_count = 2,
     deps = [
-        ":compatibility",
         ":cpu_check",
         ":optimized_base",
         ":reference_base",
@@ -1378,10 +1390,44 @@ cc_test(
 )
 
 cc_test(
+    name = "kernel_utils_test",
+    srcs = ["kernel_utils_test.cc"],
+    deps = [
+        ":kernel_utils",
+        "//tensorflow/lite:array",
+        "//tensorflow/lite:util",
+        "//tensorflow/lite/core/c:common",
+        "//tensorflow/lite/kernels:test_util",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "reduce_utils_test",
     srcs = ["optimized/reduce_utils_test.cc"],
     deps = [
         ":reduce_utils",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "broadcast_loop_test",
+    srcs = ["broadcast_loop_test.cc"],
+    deps = [
+        ":reference_comparisons",
+        ":runtime_shape",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "select_test",
+    srcs = ["select_test.cc"],
+    deps = [
+        ":reference_base",
+        ":runtime_shape",
         "@com_google_googletest//:gtest_main",
     ],
 )

@@ -611,7 +611,7 @@ class SparseFillEmptyRowsTest(test_util.TensorFlowTestCase):
                 reverse_index_map=[-1, 3], grad_values=[]
             )
         )
-        self.assertAllEqual(grad, [0., 0.])
+        self.assertAllEqual(grad, [0.0, 0.0])
       else:
         with self.assertRaisesRegex(
             (ValueError, errors.InvalidArgumentError),
@@ -1270,6 +1270,28 @@ class SparseTransposeTest(test.TestCase):
           expected_trans = array_ops.transpose(dn_input, perm=perm)
           self.assertAllEqual(expected_trans.shape, sp_trans.get_shape())
           self.assertAllEqual(dn_trans, expected_trans)
+
+  @test_util.run_in_graph_and_eager_modes
+  def testTransposeInvalidPerm(self):
+    sp_input = sparse_tensor.SparseTensor(
+        indices=[[0, 1], [2, 3]], values=[1.0, 2.0], dense_shape=[4, 5]
+    )
+    for invalid_perm in [[0, 0], [0, 2], [-1, 0], [0], [0, 1, 2], [[1, 0]]]:
+      with self.assertRaisesRegex(
+          ValueError,
+          "'perm' must be a 1-D permutation of the dimensions of 'sp_input'",
+      ):
+        sparse_ops.sparse_transpose(sp_input, perm=invalid_perm)
+
+  @test_util.run_deprecated_v1
+  def testTransposeInvalidPermDynamicRank(self):
+    sp_input = array_ops.sparse_placeholder(dtypes.float32, shape=None)
+    for invalid_perm in [[0, 0], [0, 2], [-1, 0], [[1, 0]]]:
+      with self.assertRaisesRegex(
+          ValueError,
+          "'perm' must be a 1-D permutation of the dimensions of 'sp_input'",
+      ):
+        sparse_ops.sparse_transpose(sp_input, perm=invalid_perm)
 
 
 class SparsePlaceholderTest(test.TestCase):

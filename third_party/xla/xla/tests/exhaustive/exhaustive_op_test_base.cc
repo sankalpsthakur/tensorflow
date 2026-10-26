@@ -31,12 +31,12 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/meta/type_traits.h"
+#include "absl/status/status_macros.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/bit_cast.h"
 #include "xla/client/executable_build_options.h"
 #include "xla/fp_util.h"
@@ -438,9 +438,8 @@ template <typename NativeT>
 int64_t GetDistanceErr(NativeT expected, NativeT actual) {
   if constexpr (std::is_same_v<NativeT, xla::complex64> ||
                 std::is_same_v<NativeT, xla::complex128>) {
-    return std::max(
-        CalculateDistanceInFloats(expected.real(), actual.real()),
-        CalculateDistanceInFloats(expected.imag(), expected.imag()));
+    return std::max(CalculateDistanceInFloats(expected.real(), actual.real()),
+                    CalculateDistanceInFloats(expected.imag(), actual.imag()));
   } else {
     return CalculateDistanceInFloats(expected, actual);
   }
